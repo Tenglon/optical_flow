@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.1",
+    "nvidia-cuda-nvcc>=13.3.73",
     "opencv-contrib-python-headless>=5.0.0.93",
     "torch>=2.13.0",
 ]
