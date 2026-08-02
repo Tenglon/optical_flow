@@ -268,7 +268,9 @@ def _cudagraph_safe(fn):
     def wrapped(*args):
         torch.compiler.cudagraph_mark_step_begin()
         out = fn(*args)
-        return tuple(o.clone() for o in out) if isinstance(out, tuple) else out.clone()
+        if isinstance(out, tuple):
+            return tuple(o.clone() if isinstance(o, torch.Tensor) else o for o in out)
+        return out.clone()
     return wrapped
 
 
