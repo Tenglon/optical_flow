@@ -105,6 +105,158 @@ def _median_blur(x: torch.Tensor, ksize: int) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
+# Compilable hot functions
+#
+# The two functions below are pure (tensor args in, tensors out, no Python
+# data-dependent branching -- the float/None args are static and simply get
+# baked into the trace) so they can be wrapped with torch.compile while the
+# outer pyramid / warp / iteration loops stay eager.  `_tvl1_step` is the hot
+# spot: it runs up to warps * outer * inner (~1500) times per pyramid level.
+# --------------------------------------------------------------------------- #
+def _tvl1_warp_setup(
+    I1g: torch.Tensor,
+    I0: torch.Tensor,
+    u: torch.Tensor,
+    xs: torch.Tensor,
+    ys: torch.Tensor,
+    sx: float,
+    sy: float,
+    l_t: float,
+):
+    """Per-warp setup: warp I1 (+gradients) to x+u and linearize the residual.
+
+    grid_sample(align_corners=True, mode="bicubic") matches
+    cv2.remap(..., INTER_CUBIC) with the default constant-0 border: both use
+    the alpha = -0.75 cubic kernel with zero-valued out-of-image taps.
+    Returns (I1wx, I1wy, rho_c, thr, pos, safe_grad).
+    """
+    grid = torch.stack([sx * (xs + u[:, 0]) - 1.0, sy * (ys + u[:, 1]) - 1.0], dim=-1)
+    I1wg = F.grid_sample(I1g, grid, mode="bicubic", padding_mode="zeros", align_corners=True)
+    I1w, I1wx, I1wy = I1wg[:, 0:1], I1wg[:, 1:2], I1wg[:, 2:3]
+
+    grad = I1wx * I1wx + I1wy * I1wy
+    # Constant part of the linearized residual rho(u) around u0 = u.
+    rho_c = I1w - I1wx * u[:, 0:1] - I1wy * u[:, 1:2] - I0
+    pos = grad > _FLT_EPS
+    safe_grad = torch.where(pos, grad, torch.ones_like(grad))
+    thr = l_t * grad
+    return I1wx, I1wy, rho_c, thr, pos, safe_grad
+
+
+def _tvl1_step(
+    u: torch.Tensor,
+    u3: torch.Tensor | None,
+    p: torch.Tensor,
+    p3: torch.Tensor | None,
+    active: torch.Tensor,
+    rho_c: torch.Tensor,
+    I1wx: torch.Tensor,
+    I1wy: torch.Tensor,
+    thr: torch.Tensor,
+    pos: torch.Tensor,
+    safe_grad: torch.Tensor,
+    l_t: float,
+    theta: float,
+    taut: float,
+    gamma: float,
+    scaled_eps: float,
+):
+    """One primal-dual iteration (OpenCV inner-loop body); pure function.
+
+    Returns the updated ``(u, u3, p, p3, active)``.  ``active`` freezes
+    converged batch samples (see `_proc_one_scale`).
+    """
+    use_gamma = gamma != 0.0  # static: specialized at trace time
+
+    # ---- thresholding step (proximal operator of the L1 data term):
+    # v = u + shrink(rho) * grad I1w
+    rho = rho_c + I1wx * u[:, 0:1] + I1wy * u[:, 1:2]
+    if use_gamma:
+        rho = rho + gamma * u3
+    fi = -rho / safe_grad
+    lo = rho < -thr
+    hi = rho > thr
+    d1 = torch.where(lo, l_t * I1wx, torch.where(hi, -l_t * I1wx, torch.where(pos, fi * I1wx, 0.0)))
+    d2 = torch.where(lo, l_t * I1wy, torch.where(hi, -l_t * I1wy, torch.where(pos, fi * I1wy, 0.0)))
+    v = u + torch.cat([d1, d2], dim=1)
+    if use_gamma:
+        d3 = torch.where(
+            lo, torch.full_like(rho, l_t * gamma),
+            torch.where(hi, torch.full_like(rho, -l_t * gamma), torch.where(pos, fi * gamma, 0.0)),
+        )
+        v3 = u3 + d3
+
+    # ---- primal update: u = v + theta * div p
+    div_p = torch.cat(
+        [_divergence(p[:, 0:1], p[:, 1:2]), _divergence(p[:, 2:3], p[:, 3:4])],
+        dim=1,
+    )
+    u_new = v + theta * div_p
+    err = ((u_new - u) ** 2).sum(dim=(1, 2, 3))
+    if use_gamma:
+        u3_new = v3 + theta * _divergence(p3[:, 0:1], p3[:, 1:2])
+        err = err + ((u3_new - u3) ** 2).sum(dim=(1, 2, 3))
+    u = torch.where(active, u_new, u)
+    if use_gamma:
+        u3 = torch.where(active, u3_new, u3)
+
+    # ---- dual ascent + reprojection:
+    # p = (p + taut * grad u) / (1 + taut * |grad u|)
+    u1x, u1y = _forward_gradient(u[:, 0:1])
+    u2x, u2y = _forward_gradient(u[:, 1:2])
+    ng1 = 1.0 + taut * torch.hypot(u1x, u1y)
+    ng2 = 1.0 + taut * torch.hypot(u2x, u2y)
+    p_new = torch.cat(
+        [
+            (p[:, 0:1] + taut * u1x) / ng1,
+            (p[:, 1:2] + taut * u1y) / ng1,
+            (p[:, 2:3] + taut * u2x) / ng2,
+            (p[:, 3:4] + taut * u2y) / ng2,
+        ],
+        dim=1,
+    )
+    p = torch.where(active, p_new, p)
+    if use_gamma:
+        u3x, u3y = _forward_gradient(u3)
+        ng3 = 1.0 + taut * torch.hypot(u3x, u3y)
+        p3_new = torch.cat([(p3[:, 0:1] + taut * u3x) / ng3, (p3[:, 1:2] + taut * u3y) / ng3], dim=1)
+        p3 = torch.where(active, p3_new, p3)
+
+    # Deactivate converged samples *after* this iteration's dual update
+    # (OpenCV checks the loop condition on entry).
+    active = active & (err > scaled_eps).view(-1, 1, 1, 1)
+    return u, u3, p, p3, active
+
+
+# Lazily-created compiled variants of the hot functions, keyed by backend.
+# dynamic=False: each pyramid-level shape compiles once and is then reused
+# across warps / iterations / calls (a handful of shapes in total).
+_COMPILED_FNS: dict[str, tuple] = {}
+
+
+def _resolve_backend(backend: str, device: torch.device) -> tuple:
+    """Return (step_fn, warp_fn) for the requested backend, caching compiles."""
+    if backend == "eager":
+        return _tvl1_step, _tvl1_warp_setup
+    if backend not in ("compile", "cudagraphs"):
+        raise ValueError(f"backend must be 'eager', 'compile' or 'cudagraphs', got {backend!r}")
+    if backend == "cudagraphs" and device.type != "cuda":
+        raise RuntimeError("backend='cudagraphs' requires CUDA input tensors")
+    if backend not in _COMPILED_FNS:
+        import torch._dynamo
+
+        # One graph per (backend, pyramid-level shape); make sure dynamo never
+        # hits its recompile limit and silently falls back to eager.
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
+        mode = "reduce-overhead" if backend == "cudagraphs" else None
+        _COMPILED_FNS[backend] = (
+            torch.compile(_tvl1_step, dynamic=False, mode=mode),
+            torch.compile(_tvl1_warp_setup, dynamic=False, mode=mode),
+        )
+    return _COMPILED_FNS[backend]
+
+
+# --------------------------------------------------------------------------- #
 # Single pyramid level: warps x (outer x inner) primal-dual iterations
 # --------------------------------------------------------------------------- #
 def _proc_one_scale(
@@ -122,12 +274,15 @@ def _proc_one_scale(
     outer_iterations: int,
     gamma: float,
     median_filtering: int,
+    step_fn=_tvl1_step,
+    warp_fn=_tvl1_warp_setup,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the TV-L1 solver at one pyramid level.
 
     I0, I1: (B, 1, h, w) images; u: (B, 2, h, w) flow (updated in place of the
     return value); u3: (B, 1, h, w) illumination multiplier field (gamma != 0
-    only).  Mirrors OpticalFlowDual_TVL1::procOneScale.
+    only).  Mirrors OpticalFlowDual_TVL1::procOneScale.  ``step_fn`` /
+    ``warp_fn`` are `_tvl1_step` / `_tvl1_warp_setup` or compiled variants.
     """
     b, _, h, w = I0.shape
     dt, dev = I0.dtype, I0.device
@@ -152,23 +307,11 @@ def _proc_one_scale(
     # Dual variables are reset once per pyramid level (as in OpenCV).
     p = torch.zeros(b, 4, h, w, dtype=dt, device=dev)  # p11, p12, p21, p22
     p3 = torch.zeros(b, 2, h, w, dtype=dt, device=dev) if use_gamma else None
-    zero = I0.new_zeros(())
 
     for _warp in range(warps):
-        # ---- warp I1 and its gradient to x + u0 (bicubic, zero border) ----
-        # grid_sample(align_corners=True, mode="bicubic") matches
-        # cv2.remap(..., INTER_CUBIC) with the default constant-0 border:
-        # both use the alpha = -0.75 cubic kernel with zero-valued
-        # out-of-image taps.
-        grid = torch.stack([sx * (xs + u[:, 0]) - 1.0, sy * (ys + u[:, 1]) - 1.0], dim=-1)
-        I1wg = F.grid_sample(I1g, grid, mode="bicubic", padding_mode="zeros", align_corners=True)
-        I1w, I1wx, I1wy = I1wg[:, 0:1], I1wg[:, 1:2], I1wg[:, 2:3]
-
-        grad = I1wx * I1wx + I1wy * I1wy
-        # Constant part of the linearized residual rho(u) around u0 = u.
-        rho_c = I1w - I1wx * u[:, 0:1] - I1wy * u[:, 1:2] - I0
-        pos = grad > _FLT_EPS
-        safe_grad = torch.where(pos, grad, torch.ones_like(grad))
+        # Warp I1 and its gradient to x + u0 (bicubic, zero border) and
+        # linearize the residual around the current flow.
+        I1wx, I1wy, rho_c, thr, pos, safe_grad = warp_fn(I1g, I0, u, xs, ys, sx, sy, l_t)
 
         # Per-sample convergence mask emulating OpenCV's epsilon early stop:
         # once a sample's summed squared update drops below eps^2*h*w its
@@ -179,65 +322,11 @@ def _proc_one_scale(
             if median_filtering > 1:
                 u = torch.where(active, _median_blur(u, median_filtering), u)
             for _inner in range(inner_iterations):
-                # ---- thresholding step (proximal operator of the L1 data term):
-                # v = u + shrink(rho) * grad I1w
-                rho = rho_c + I1wx * u[:, 0:1] + I1wy * u[:, 1:2]
-                if use_gamma:
-                    rho = rho + gamma * u3
-                thr = l_t * grad
-                fi = -rho / safe_grad
-                lo = rho < -thr
-                hi = rho > thr
-                d1 = torch.where(lo, l_t * I1wx, torch.where(hi, -l_t * I1wx, torch.where(pos, fi * I1wx, zero)))
-                d2 = torch.where(lo, l_t * I1wy, torch.where(hi, -l_t * I1wy, torch.where(pos, fi * I1wy, zero)))
-                v = u + torch.cat([d1, d2], dim=1)
-                if use_gamma:
-                    d3 = torch.where(
-                        lo, torch.full_like(rho, l_t * gamma),
-                        torch.where(hi, torch.full_like(rho, -l_t * gamma),
-                                    torch.where(pos, fi * gamma, zero)),
-                    )
-                    v3 = u3 + d3
-
-                # ---- primal update: u = v + theta * div p
-                div_p = torch.cat(
-                    [_divergence(p[:, 0:1], p[:, 1:2]), _divergence(p[:, 2:3], p[:, 3:4])],
-                    dim=1,
+                u, u3, p, p3, active = step_fn(
+                    u, u3, p, p3, active,
+                    rho_c, I1wx, I1wy, thr, pos, safe_grad,
+                    l_t, theta, taut, gamma, scaled_eps,
                 )
-                u_new = v + theta * div_p
-                err = ((u_new - u) ** 2).sum(dim=(1, 2, 3))
-                if use_gamma:
-                    u3_new = v3 + theta * _divergence(p3[:, 0:1], p3[:, 1:2])
-                    err = err + ((u3_new - u3) ** 2).sum(dim=(1, 2, 3))
-                u = torch.where(active, u_new, u)
-                if use_gamma:
-                    u3 = torch.where(active, u3_new, u3)
-
-                # ---- dual ascent + reprojection:
-                # p = (p + taut * grad u) / (1 + taut * |grad u|)
-                u1x, u1y = _forward_gradient(u[:, 0:1])
-                u2x, u2y = _forward_gradient(u[:, 1:2])
-                ng1 = 1.0 + taut * torch.hypot(u1x, u1y)
-                ng2 = 1.0 + taut * torch.hypot(u2x, u2y)
-                p_new = torch.cat(
-                    [
-                        (p[:, 0:1] + taut * u1x) / ng1,
-                        (p[:, 1:2] + taut * u1y) / ng1,
-                        (p[:, 2:3] + taut * u2x) / ng2,
-                        (p[:, 3:4] + taut * u2y) / ng2,
-                    ],
-                    dim=1,
-                )
-                p = torch.where(active, p_new, p)
-                if use_gamma:
-                    u3x, u3y = _forward_gradient(u3)
-                    ng3 = 1.0 + taut * torch.hypot(u3x, u3y)
-                    p3_new = torch.cat([(p3[:, 0:1] + taut * u3x) / ng3, (p3[:, 1:2] + taut * u3y) / ng3], dim=1)
-                    p3 = torch.where(active, p3_new, p3)
-
-                # Deactivate converged samples *after* this iteration's dual
-                # update (OpenCV checks the loop condition on entry).
-                active = active & (err > scaled_eps).view(b, 1, 1, 1)
 
     return u, u3
 
@@ -262,6 +351,7 @@ def calc_flow_tvl1(
     median_filtering: int = 5,
     use_initial_flow: bool = False,
     initial_flow: torch.Tensor | None = None,
+    backend: str = "eager",
 ) -> torch.Tensor:
     """Batched dense optical flow with the Dual TV-L1 method.
 
@@ -291,6 +381,21 @@ def calc_flow_tvl1(
         use_initial_flow: seed the pyramid with ``initial_flow`` instead of 0.
         initial_flow: ``(B, 2, H, W)`` seed flow, required when
             ``use_initial_flow`` is True.
+        backend: execution backend for the hot per-iteration update
+            (`_tvl1_step`) and the per-warp setup (`_tvl1_warp_setup`):
+
+            - ``"eager"`` (default): plain PyTorch, byte-identical to the
+              reference implementation.
+            - ``"compile"``: ``torch.compile(..., dynamic=False)`` -- fuses
+              the ~30 elementwise kernels of each iteration; each pyramid
+              level shape compiles once (lazily, cached at module level and
+              reused across calls).  Note: on CPU, Inductor needs a C++20
+              compiler (GCC >= 10); point the ``CXX`` env var at one if the
+              system default is older.
+            - ``"cudagraphs"``: ``torch.compile(..., mode="reduce-overhead",
+              dynamic=False)`` -- additionally replays CUDA graphs to remove
+              launch overhead (the solver is launch-bound on GPU).  Requires
+              CUDA input tensors.
 
     Returns:
         Flow tensor of shape ``(B, 2, H, W)``, same device/dtype as the
@@ -307,6 +412,7 @@ def calc_flow_tvl1(
         raise ValueError("nscales must be >= 1")
     if use_initial_flow and initial_flow is None:
         raise ValueError("use_initial_flow=True requires initial_flow")
+    step_fn, warp_fn = _resolve_backend(backend, prev.device)
 
     if not torch.is_floating_point(prev):
         prev = prev.to(torch.float32)
@@ -356,6 +462,8 @@ def calc_flow_tvl1(
             outer_iterations=outer_iterations,
             gamma=gamma,
             median_filtering=median_filtering,
+            step_fn=step_fn,
+            warp_fn=warp_fn,
         )
         if s > 0:
             u = F.interpolate(u, size=sizes[s - 1], mode="bilinear", align_corners=False) * (1.0 / scale_step)
@@ -385,7 +493,8 @@ def calc_flow_tvl1_video(
         chunk: optional micro-batch size bounding peak memory: the flattened
             pair batch is processed ``chunk`` pairs at a time and the results
             concatenated.  ``None`` (default) = one single batch.
-        **params: forwarded to :func:`calc_flow_tvl1`.
+        **params: forwarded to :func:`calc_flow_tvl1` (including
+            ``backend="eager" | "compile" | "cudagraphs"``).
 
     Returns:
         Flow tensor as described above (cv2 sign convention, pixels).
@@ -559,6 +668,37 @@ if __name__ == "__main__":
         f"max |chunk=2 - chunk=None| = {d_chunk:.3e}"
     )
     ok &= fnt.shape == (2, 3, 2, Hv, Wv) and d_loop2 < 1e-4 and d_chunk < 1e-4
+
+    # ---------------- backend="compile" parity (CPU) ----------------
+    fp, fn_ = frames_t[0:1], frames_t[1:2]
+    fe = calc_flow_tvl1(fp, fn_, **fast)
+    t0 = time.time()
+    fc = calc_flow_tvl1(fp, fn_, backend="compile", **fast)
+    t_compile = time.time() - t0
+    t0 = time.time()
+    fc2 = calc_flow_tvl1(fp, fn_, backend="compile", **fast)  # warm (cached)
+    t_warm = time.time() - t0
+    cdiff = float((fe - fc).abs().max())
+    cdiff2 = float((fc - fc2).abs().max())
+    print(
+        f"[compile] maxdiff vs eager = {cdiff:.3e} "
+        f"(first call {t_compile:.1f}s incl. compile, warm {t_warm:.1f}s, rerun diff {cdiff2:.1e})"
+    )
+    ok &= torch.allclose(fe, fc, atol=1e-3, rtol=1e-4) and cdiff2 == 0.0
+
+    # "cudagraphs" needs CUDA; on CPU the guard must reject it cleanly.
+    if torch.cuda.is_available():
+        fg = calc_flow_tvl1(fp.cuda(), fn_.cuda(), backend="cudagraphs", **fast).cpu()
+        gdiff = float((fe - fg).abs().max())
+        print(f"[cudagraphs] maxdiff vs eager = {gdiff:.3e}")
+        ok &= torch.allclose(fe, fg, atol=1e-3, rtol=1e-4)
+    else:
+        try:
+            calc_flow_tvl1(fp, fn_, backend="cudagraphs", **fast)
+            print("[cudagraphs] ERROR: CPU call did not raise")
+            ok = False
+        except RuntimeError as e:
+            print(f"[cudagraphs] no CUDA here; guard raised as expected ({e})")
 
     print("PASS" if ok else "FAIL")
     raise SystemExit(0 if ok else 1)

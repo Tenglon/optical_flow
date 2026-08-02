@@ -144,6 +144,141 @@ def _warp(img: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Hot inner steps (pure tensor functions, torch.compile-able)
+# ---------------------------------------------------------------------------
+
+def _build_system(
+    du, dv, cu, cv_,
+    Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz,
+    dnorm, dnorm_x, dnorm_y,
+    dx_u0, dy_u0, dx_v0, dy_v0,
+    hmask, vmask,
+    delta2: float, gamma2: float, alpha2: float,
+):
+    """Rebuild the linearized system for one fixed-point iteration.
+
+    Pure tensor function (no data-dependent Python branching) so it can be
+    wrapped with ``torch.compile``.  Returns the system coefficients
+    (A11, A12, A22, b1, b2) and the SOR neighbor weights (wL, wC, wT).
+    """
+    zeta2 = _ZETA * _ZETA
+    eps2 = _EPSILON * _EPSILON
+
+    # ---- data term: robust color + gradient constancy, linearized at du, dv ----
+    # color constancy:  Psi'( (Iz + Ix du + Iy dv)^2 / dnorm ) / dnorm
+    ik1z = Iz + Ix * du + Iy * dv
+    wd = delta2 / (torch.sqrt(ik1z * ik1z / dnorm + eps2) * dnorm)
+    A11 = wd * (Ix * Ix) + zeta2
+    A12 = wd * (Ix * Iy)
+    A22 = wd * (Iy * Iy) + zeta2
+    b1 = -wd * (Iz * Ix)
+    b2 = -wd * (Iz * Iy)
+    # gradient constancy
+    ik1zx = Ixz + Ixx * du + Ixy * dv
+    ik1zy = Iyz + Ixy * du + Iyy * dv
+    wg = gamma2 / torch.sqrt(ik1zx * ik1zx / dnorm_x + ik1zy * ik1zy / dnorm_y + eps2)
+    A11 = A11 + wg * (Ixx * Ixx / dnorm_x + Ixy * Ixy / dnorm_y)
+    A12 = A12 + wg * (Ixx * Ixy / dnorm_x + Ixy * Iyy / dnorm_y)
+    A22 = A22 + wg * (Ixy * Ixy / dnorm_x + Iyy * Iyy / dnorm_y)
+    b1 = b1 - wg * (Ixx * Ixz / dnorm_x + Ixy * Iyz / dnorm_y)
+    b2 = b2 - wg * (Ixy * Ixz / dnorm_x + Iyy * Iyz / dnorm_y)
+
+    # ---- smoothness term: TV weight from the current flow estimate ----
+    # w(i,j) = (alpha/2) / |grad w|, shared by the two forward edges
+    # (i,j)-(i,j+1) and (i,j)-(i+1,j), forward differences, replicate border.
+    ux, uy = _fwd_dx(cu), _fwd_dy(cu)
+    vx, vy = _fwd_dx(cv_), _fwd_dy(cv_)
+    wS = alpha2 / torch.sqrt(ux * ux + vx * vx + uy * uy + vy * vy + eps2)
+    wh = wS * hmask  # horizontal edge weights (no edge out of last column)
+    wv = wS * vmask  # vertical edge weights (no edge out of last row)
+
+    # add smoothness contributions of the *level-initial* flow (u0, v0) to b,
+    # and the edge weights to the diagonal A11/A22 (A12 gets none)
+    fx_u, fy_u = wh * dx_u0, wv * dy_u0
+    fx_v, fy_v = wh * dx_v0, wv * dy_v0
+    wsum = wh + _shift_right(wh) + wv + _shift_down(wv)
+    A11 = A11 + wsum
+    A22 = A22 + wsum
+    b1 = b1 + fx_u - _shift_right(fx_u) + fy_u - _shift_down(fy_u)
+    b2 = b2 + fx_v - _shift_right(fx_v) + fy_v - _shift_down(fy_v)
+
+    # SOR neighbor weights: left edge w(i,j-1), top edge w(i-1,j),
+    # right/bottom edge w(i,j); out-of-domain terms vanish.
+    wL = _shift_right(wS).unsqueeze(1)  # (B,1,H,W)
+    wT = _shift_down(wS).unsqueeze(1)
+    wC = wS.unsqueeze(1)
+    return A11, A12, A22, b1, b2, wL, wC, wT
+
+
+def _sor_step(d, wL, wC, wT, A11, A12, A22, b1, b2, red, black, omega: float):
+    """One full red-black SOR sweep (red update, then black) for d = (du, dv).
+
+    This is the hot inner step, executed sor_iterations times per fixed-point
+    iteration.  Pure tensor function with a statically unrolled 2-color loop,
+    no data-dependent branching, so it is safe to torch.compile.
+    """
+    for mask in (red, black):
+        sig = (
+            wL * _shift_right(d)
+            + wC * _shift_left(d)
+            + wT * _shift_down(d)
+            + wC * _shift_up(d)
+        )
+        sig_u, sig_v = sig[:, 0], sig[:, 1]
+        du, dv = d[:, 0], d[:, 1]
+        du_new = du + omega * ((sig_u + b1 - dv * A12) / A11 - du)
+        du = torch.where(mask, du_new, du)
+        # dv update uses the just-updated du (as in OpenCV's inner loop)
+        dv_new = dv + omega * ((sig_v + b2 - du * A12) / A22 - dv)
+        dv = torch.where(mask, dv_new, dv)
+        d = torch.stack((du, dv), dim=1)
+    return d
+
+
+# Lazily created torch.compile wrappers of the hot steps, keyed by backend.
+# We deliberately compile with dynamic=False: the SOR step is launch-bound and
+# the ~44 pyramid shapes recur on every call, so each (shape, B) specializes
+# once into its own fast graph and is served from the dynamo cache afterwards
+# (cache limits are raised below to hold all per-level variants).  We chose
+# per-shape specialization over marking dims dynamic or shape bucketing:
+# recompiles are a one-time warm-up cost, while static shapes give Inductor /
+# CUDA graphs the most freedom (and "cudagraphs" requires static shapes anyway).
+_COMPILED_FNS: dict[str, tuple] = {}
+
+
+def _resolve_backend(backend: str):
+    """Return (build_system_fn, sor_step_fn) for the requested backend."""
+    if backend == "eager":
+        return _build_system, _sor_step
+    if backend in _COMPILED_FNS:
+        return _COMPILED_FNS[backend]
+    if backend not in ("compile", "cudagraphs"):
+        raise ValueError(
+            f"backend must be 'eager', 'compile' or 'cudagraphs', got {backend!r}"
+        )
+    import torch._dynamo as _dynamo
+
+    # one graph per (pyramid-level shape x batch size); make room for all of them
+    _dynamo.config.cache_size_limit = max(_dynamo.config.cache_size_limit, 512)
+    if hasattr(_dynamo.config, "accumulated_cache_size_limit"):
+        _dynamo.config.accumulated_cache_size_limit = max(
+            _dynamo.config.accumulated_cache_size_limit, 2048
+        )
+    if backend == "compile":
+        fns = (
+            torch.compile(_build_system, dynamic=False),
+            torch.compile(_sor_step, dynamic=False),
+        )
+    else:  # "cudagraphs": CUDA-graph capture to eliminate launch overhead
+        fns = (
+            torch.compile(_build_system, mode="reduce-overhead", dynamic=False),
+            torch.compile(_sor_step, mode="reduce-overhead", dynamic=False),
+        )
+    _COMPILED_FNS[backend] = fns
+    return fns
+
+
+# ---------------------------------------------------------------------------
 # Single-level variational refinement (port of cv::VariationalRefinement)
 # ---------------------------------------------------------------------------
 
@@ -158,19 +293,21 @@ def _variational_refinement(
     fixed_point_iterations: int,
     sor_iterations: int,
     omega: float,
+    sys_fn=_build_system,
+    sor_fn=_sor_step,
 ) -> torch.Tensor:
     """Refine ``flow`` (B, 2, H, W) on one pyramid level.
 
     Direct port of ``cv::VariationalRefinement::calcUV``: warp once per level,
     then ``fixed_point_iterations`` relinearizations of the robust data /
     smoothness weights, each solved by ``sor_iterations`` red-black SOR sweeps
-    for the flow increment (du, dv).
+    for the flow increment (du, dv).  ``sys_fn`` / ``sor_fn`` are the (possibly
+    torch.compile-wrapped) hot inner steps.
     """
     B, H, W = I0.shape
     u0, v0 = flow[:, 0], flow[:, 1]
 
     zeta2 = _ZETA * _ZETA
-    eps2 = _EPSILON * _EPSILON
     delta2 = delta / 2.0  # per-term weights as in OpenCV (delta/2, gamma/2, alpha/2)
     gamma2 = gamma / 2.0
     alpha2 = alpha / 2.0
@@ -209,67 +346,20 @@ def _variational_refinement(
     dx_v0, dy_v0 = _fwd_dx(v0), _fwd_dy(v0)
 
     for _ in range(fixed_point_iterations):
-        # ---- data term: robust color + gradient constancy, linearized at du, dv ----
-        # color constancy:  Psi'( (Iz + Ix du + Iy dv)^2 / dnorm ) / dnorm
-        ik1z = Iz + Ix * du + Iy * dv
-        wd = delta2 / (torch.sqrt(ik1z * ik1z / dnorm + eps2) * dnorm)
-        A11 = wd * (Ix * Ix) + zeta2
-        A12 = wd * (Ix * Iy)
-        A22 = wd * (Iy * Iy) + zeta2
-        b1 = -wd * (Iz * Ix)
-        b2 = -wd * (Iz * Iy)
-        # gradient constancy
-        ik1zx = Ixz + Ixx * du + Ixy * dv
-        ik1zy = Iyz + Ixy * du + Iyy * dv
-        wg = gamma2 / torch.sqrt(ik1zx * ik1zx / dnorm_x + ik1zy * ik1zy / dnorm_y + eps2)
-        A11 = A11 + wg * (Ixx * Ixx / dnorm_x + Ixy * Ixy / dnorm_y)
-        A12 = A12 + wg * (Ixx * Ixy / dnorm_x + Ixy * Iyy / dnorm_y)
-        A22 = A22 + wg * (Ixy * Ixy / dnorm_x + Iyy * Iyy / dnorm_y)
-        b1 = b1 - wg * (Ixx * Ixz / dnorm_x + Ixy * Iyz / dnorm_y)
-        b2 = b2 - wg * (Ixy * Ixz / dnorm_x + Iyy * Iyz / dnorm_y)
-
-        # ---- smoothness term: TV weight from the current flow estimate ----
-        # w(i,j) = (alpha/2) / |grad w|, shared by the two forward edges
-        # (i,j)-(i,j+1) and (i,j)-(i+1,j), forward differences, replicate border.
-        ux, uy = _fwd_dx(cu), _fwd_dy(cu)
-        vx, vy = _fwd_dx(cv_), _fwd_dy(cv_)
-        wS = alpha2 / torch.sqrt(ux * ux + vx * vx + uy * uy + vy * vy + eps2)
-        wh = wS * hmask  # horizontal edge weights (no edge out of last column)
-        wv = wS * vmask  # vertical edge weights (no edge out of last row)
-
-        # add smoothness contributions of the *level-initial* flow (u0, v0) to b,
-        # and the edge weights to the diagonal A11/A22 (A12 gets none)
-        fx_u, fy_u = wh * dx_u0, wv * dy_u0
-        fx_v, fy_v = wh * dx_v0, wv * dy_v0
-        wsum = wh + _shift_right(wh) + wv + _shift_down(wv)
-        A11 = A11 + wsum
-        A22 = A22 + wsum
-        b1 = b1 + fx_u - _shift_right(fx_u) + fy_u - _shift_down(fy_u)
-        b2 = b2 + fx_v - _shift_right(fx_v) + fy_v - _shift_down(fy_v)
+        # linearize data + smoothness terms around (du, dv) / current flow
+        A11, A12, A22, b1, b2, wL, wC, wT = sys_fn(
+            du, dv, cu, cv_,
+            Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz,
+            dnorm, dnorm_x, dnorm_y,
+            dx_u0, dy_u0, dx_v0, dy_v0,
+            hmask, vmask,
+            delta2, gamma2, alpha2,
+        )
 
         # ---- red-black SOR on the linearized system for (du, dv) ----
-        # neighbor weights: left edge w(i,j-1), top edge w(i-1,j), right/bottom w(i,j);
-        # out-of-domain terms vanish (zero weight or zero shifted-in du).
-        wL = _shift_right(wS).unsqueeze(1)  # (B,1,H,W)
-        wT = _shift_down(wS).unsqueeze(1)
-        wC = wS.unsqueeze(1)
         d = torch.stack((du, dv), dim=1)  # (B,2,H,W)
         for _s in range(sor_iterations):
-            for mask in (red, black):
-                sig = (
-                    wL * _shift_right(d)
-                    + wC * _shift_left(d)
-                    + wT * _shift_down(d)
-                    + wC * _shift_up(d)
-                )
-                sig_u, sig_v = sig[:, 0], sig[:, 1]
-                du, dv = d[:, 0], d[:, 1]
-                du_new = du + omega * ((sig_u + b1 - dv * A12) / A11 - du)
-                du = torch.where(mask, du_new, du)
-                # dv update uses the just-updated du (as in OpenCV's inner loop)
-                dv_new = dv + omega * ((sig_v + b2 - du * A12) / A22 - dv)
-                dv = torch.where(mask, dv_new, dv)
-                d = torch.stack((du, dv), dim=1)
+            d = sor_fn(d, wL, wC, wT, A11, A12, A22, b1, b2, red, black, omega)
         du, dv = d[:, 0], d[:, 1]
 
         cu = u0 + du
@@ -295,6 +385,7 @@ def calc_flow_deepflow(
     delta: float = 0.5,
     gamma: float = 5.0,
     omega: float = 1.6,
+    backend: str = "eager",
 ) -> torch.Tensor:
     """Dense optical flow, replicating ``cv2.optflow.createOptFlow_DeepFlow``.
 
@@ -310,6 +401,15 @@ def calc_flow_deepflow(
             gradient constancy weight (DeepFlow parameterization; internally
             remapped to alpha*4, delta/3, gamma/3 as OpenCV does).
         omega: SOR relaxation factor.
+        backend: execution backend for the hot inner steps (the per-iteration
+            system rebuild and the red-black SOR sweep, ~44 levels x 5 x 25
+            executions).  "eager" (default, byte-identical reference path),
+            "compile" (torch.compile(dynamic=False); each pyramid-level shape
+            specializes once and is then served from the dynamo cache), or
+            "cudagraphs" (torch.compile mode="reduce-overhead", CUDA-only;
+            eliminates kernel-launch overhead via CUDA graph replay).  Outer
+            pyramid / fixed-point / SOR loops always stay eager, so tracing
+            never unrolls them.
 
     Returns:
         (B, 2, H, W) flow in pixels, cv2 sign convention: channel 0 = u (x),
@@ -317,6 +417,9 @@ def calc_flow_deepflow(
     """
     if prev.dim() != 3 or next.dim() != 3 or prev.shape != next.shape:
         raise ValueError("prev and next must both be (B, H, W) with equal shapes")
+    if backend == "cudagraphs" and not prev.is_cuda:
+        raise RuntimeError("backend='cudagraphs' requires CUDA input tensors")
+    sys_fn, sor_fn = _resolve_backend(backend)
     dev = prev.device
     I0 = prev.to(torch.float32)
     I1 = next.to(torch.float32)
@@ -351,6 +454,8 @@ def calc_flow_deepflow(
         fixed_point_iterations=fixed_point_iterations,
         sor_iterations=sor_iterations,
         omega=omega,
+        sys_fn=sys_fn,
+        sor_fn=sor_fn,
     )
 
     flow = torch.zeros(B, 2, *sizes[-1], device=dev, dtype=torch.float32)
@@ -365,6 +470,7 @@ def calc_flow_deepflow_video(
     frames: torch.Tensor,
     *,
     chunk: int | None = None,
+    backend: str = "eager",
     **params,
 ) -> torch.Tensor:
     """DeepFlow between all consecutive frame pairs, as one batched call.
@@ -375,6 +481,7 @@ def calc_flow_deepflow_video(
         chunk: optional micro-batch size bounding peak memory: the flattened
             pair batch is split into chunks of at most this size and the
             results concatenated.  None (default) = one single batch.
+        backend: "eager" | "compile" | "cudagraphs", see :func:`calc_flow_deepflow`.
         **params: forwarded to :func:`calc_flow_deepflow` (sigma, alpha, ...).
 
     Returns:
@@ -404,13 +511,15 @@ def calc_flow_deepflow_video(
 
     B = prev.shape[0]
     if chunk is None or chunk >= B:
-        flow = calc_flow_deepflow(prev, next_, **params)
+        flow = calc_flow_deepflow(prev, next_, backend=backend, **params)
     else:
         if chunk < 1:
             raise ValueError("chunk must be a positive integer")
         flow = torch.cat(
             [
-                calc_flow_deepflow(prev[i : i + chunk], next_[i : i + chunk], **params)
+                calc_flow_deepflow(
+                    prev[i : i + chunk], next_[i : i + chunk], backend=backend, **params
+                )
                 for i in range(0, B, chunk)
             ],
             dim=0,
@@ -556,6 +665,65 @@ if __name__ == "__main__":
         "video wrapper: max |video - loop| (T,H,W) = "
         f"{d_seq:.2e}, (N,T,H,W) = {d_nt:.2e}, |chunk=2 - chunk=None| = {d_chunk:.2e}"
     )
+
+    # ---- backend="compile": CPU parity with the eager reference path ----
+    # small pair -> ~18 pyramid shapes, so per-shape dynamic=False compiles
+    # stay cheap on the login node; "cudagraphs" is CUDA-only (guarded).
+    # Inductor CPU codegen needs g++ >= 10 (-std=c++20); the system default on
+    # this cluster is gcc 8.5, so look for a newer one (e.g. OpenHPC gnu12).
+    def _pick_modern_cxx() -> str | None:
+        import glob
+        import os
+        import shutil
+        import subprocess
+
+        cands = [os.environ.get("CXX"), shutil.which("g++")]
+        cands += sorted(glob.glob("/opt/ohpc/pub/compiler/gcc/*/bin/g++"), reverse=True)
+        cands += sorted(glob.glob("/opt/rh/gcc-toolset-*/root/usr/bin/g++"), reverse=True)
+        for c in cands:
+            if not c or not os.path.isfile(c):
+                continue
+            try:
+                ver = subprocess.run([c, "-dumpversion"], capture_output=True,
+                                     text=True, timeout=10).stdout.strip()
+                if int(ver.split(".")[0]) >= 10:
+                    return c
+            except Exception:
+                continue
+        return None
+
+    cxx = _pick_modern_cxx()
+    if cxx is None:
+        print("\nbackend='compile': SKIPPED (no g++ >= 10 found for Inductor CPU)")
+    else:
+        import os
+
+        os.environ["CXX"] = cxx
+        os.environ["PATH"] = os.path.dirname(cxx) + os.pathsep + os.environ["PATH"]
+    rc = np.random.default_rng(7)
+    small = rc.uniform(0, 255, size=(60, 80)).astype(np.float32)
+    small = cv2.GaussianBlur(small, (0, 0), 3.0)
+    small = cv2.normalize(small, None, 0, 255, cv2.NORM_MINMAX)
+    s1 = torch.from_numpy(small)
+    s2 = torch.from_numpy(np.roll(small, (1, 2), axis=(0, 1)).copy())
+    fe = calc_flow_deepflow(s1[None], s2[None])  # eager reference
+    if cxx is not None:
+        t0 = time.time()
+        fc = calc_flow_deepflow(s1[None], s2[None], backend="compile")
+        t_warm = time.time() - t0
+        t0 = time.time()
+        fc2 = calc_flow_deepflow(s1[None], s2[None], backend="compile")
+        t_hot = time.time() - t0
+        d_compile = (fc - fe).abs().max().item()
+        print(f"\nbackend='compile' (CPU): max |compile - eager| = {d_compile:.2e}"
+              f" (warm-up {t_warm:.1f}s incl. per-shape compiles, cached {t_hot:.2f}s)")
+        assert d_compile < 1e-3, "compile backend diverges from eager"
+        assert torch.equal(fc, fc2), "compiled backend not deterministic"
+    try:
+        calc_flow_deepflow(s1[None], s2[None], backend="cudagraphs")
+        raise AssertionError("cudagraphs on CPU should have been rejected")
+    except RuntimeError as e:
+        print(f"backend='cudagraphs' on CPU correctly rejected: {e}")
 
     ok = np.mean(epes_cv) < 0.5
     print("PASS" if ok else "FAIL: mean EPE vs cv2 >= 0.5")

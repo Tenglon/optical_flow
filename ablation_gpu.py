@@ -64,18 +64,20 @@ def main():
           f"{'ms/pair':>9} {'fps':>7} {'vs_eager':>8} {'maxdiff':>9}")
 
     for algo, (base_fn, params) in BASE.items():
+        # Whole-solver torch.compile is infeasible (tracing unrolls every
+        # pyramid/warp/iteration loop: ~3 h compile, host OOM). Instead the
+        # solvers expose backend=..., which compiles only the hot inner step.
         variants = {
-            "eager": base_fn,
-            "compile": torch.compile(base_fn, dynamic=False),
-            "compile-ro": torch.compile(base_fn, mode="reduce-overhead",
-                                        dynamic=False),
+            "eager": dict(params),
+            "compile": dict(params, backend="compile"),
+            "cudagraphs": dict(params, backend="cudagraphs"),
         }
         for B in BATCHES:
             p, n = load_batch(B, "cuda")
             eager_ms, eager_out = None, None
-            for name, fn in variants.items():
+            for name, kw in variants.items():
                 try:
-                    f = lambda a, b: fn(a, b, **params)
+                    f = lambda a, b: base_fn(a, b, **kw)
                     warm, t, out = bench(f, p, n)
                     ms = t / B * 1e3
                     if name == "eager":
