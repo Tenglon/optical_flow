@@ -270,12 +270,27 @@ def _resolve_backend(backend: str):
             torch.compile(_sor_step, dynamic=False),
         )
     else:  # "cudagraphs": CUDA-graph capture to eliminate launch overhead
-        fns = (
-            torch.compile(_build_system, mode="reduce-overhead", dynamic=False),
-            torch.compile(_sor_step, mode="reduce-overhead", dynamic=False),
+        fns = tuple(
+            _cudagraph_safe(torch.compile(f, mode="reduce-overhead", dynamic=False))
+            for f in (_build_system, _sor_step)
         )
     _COMPILED_FNS[backend] = fns
     return fns
+
+
+def _cudagraph_safe(fn):
+    """Make a reduce-overhead-compiled fn safe for feed-back loops.
+
+    CUDA-graph outputs live in static buffers that the next replay
+    overwrites; we mark each call as a new step and clone the outputs so
+    results that escape the iteration loop (e.g. a level's final du/dv)
+    stay valid.
+    """
+    def wrapped(*args):
+        torch.compiler.cudagraph_mark_step_begin()
+        out = fn(*args)
+        return tuple(o.clone() for o in out) if isinstance(out, tuple) else out.clone()
+    return wrapped
 
 
 # ---------------------------------------------------------------------------

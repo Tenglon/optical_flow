@@ -249,11 +249,27 @@ def _resolve_backend(backend: str, device: torch.device) -> tuple:
         # hits its recompile limit and silently falls back to eager.
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
         mode = "reduce-overhead" if backend == "cudagraphs" else None
-        _COMPILED_FNS[backend] = (
-            torch.compile(_tvl1_step, dynamic=False, mode=mode),
-            torch.compile(_tvl1_warp_setup, dynamic=False, mode=mode),
-        )
+        step = torch.compile(_tvl1_step, dynamic=False, mode=mode)
+        warp = torch.compile(_tvl1_warp_setup, dynamic=False, mode=mode)
+        if backend == "cudagraphs":
+            step, warp = _cudagraph_safe(step), _cudagraph_safe(warp)
+        _COMPILED_FNS[backend] = (step, warp)
     return _COMPILED_FNS[backend]
+
+
+def _cudagraph_safe(fn):
+    """Make a reduce-overhead-compiled fn safe for feed-back loops.
+
+    CUDA-graph outputs live in static buffers that the next replay
+    overwrites; we mark each call as a new step and clone the outputs so
+    results that escape the iteration loop (e.g. the final flow of a
+    pyramid level) stay valid.
+    """
+    def wrapped(*args):
+        torch.compiler.cudagraph_mark_step_begin()
+        out = fn(*args)
+        return tuple(o.clone() for o in out) if isinstance(out, tuple) else out.clone()
+    return wrapped
 
 
 # --------------------------------------------------------------------------- #

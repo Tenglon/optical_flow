@@ -10,10 +10,18 @@ Variants:
   srun -p gpu --gres=gpu:1 --cpus-per-task=8 --mem=32G --time=02:00:00 \
        uv run --no-sync python ablation_gpu.py
 """
+import os
+import pathlib
 import time
 
 import numpy as np
 import torch
+
+# Inductor needs nvcc; on compute nodes only the pip-wheel copy is usable.
+_CUDIR = pathlib.Path(__file__).parent / ".venv/lib/python3.12/site-packages/nvidia/cu13"
+if (_CUDIR / "bin/nvcc").exists():
+    os.environ["PATH"] = f"{_CUDIR}/bin:" + os.environ.get("PATH", "")
+    os.environ.setdefault("CUDA_HOME", str(_CUDIR))
 
 from benchmark import DEEPFLOW_PARAMS, TVL1_PARAMS
 from benchmark_data import load_pairs
@@ -61,7 +69,7 @@ def main():
     assert torch.cuda.is_available()
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
     print(f"{'algo':<9} {'variant':<11} {'B':>4} {'warmup_s':>9} "
-          f"{'ms/pair':>9} {'fps':>7} {'vs_eager':>8} {'maxdiff':>9}")
+          f"{'ms/pair':>9} {'fps':>7} {'vs_eager':>8} {'maxdiff':>9} {'meandiff':>9}")
 
     for algo, (base_fn, params) in BASE.items():
         # Whole-solver torch.compile is infeasible (tracing unrolls every
@@ -82,13 +90,14 @@ def main():
                     ms = t / B * 1e3
                     if name == "eager":
                         eager_ms, eager_out = ms, out
-                        speed, diff = 1.0, 0.0
+                        speed, diff, mdiff = 1.0, 0.0, 0.0
                     else:
                         speed = eager_ms / ms
-                        diff = (out - eager_out).abs().max().item()
+                        d = (out - eager_out).norm(dim=1)  # per-pixel EPE
+                        diff, mdiff = d.max().item(), d.mean().item()
                     print(f"{algo:<9} {name:<11} {B:>4} {warm:>9.1f} "
                           f"{ms:>9.2f} {1e3 / ms:>7.1f} {speed:>7.2f}x "
-                          f"{diff:>9.2e}", flush=True)
+                          f"{diff:>9.2e} {mdiff:>9.2e}", flush=True)
                 except Exception as e:  # noqa: BLE001 -- record and continue
                     print(f"{algo:<9} {name:<11} {B:>4} FAILED "
                           f"{type(e).__name__}: {str(e)[:120]}", flush=True)
