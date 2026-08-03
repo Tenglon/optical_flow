@@ -60,35 +60,37 @@
 \newcommand{\dfCvCpuMs}{346}      % DeepFlow @240x320, ms/pair
 \newcommand{\dfCvCpuFps}{2.9}
 \newcommand{\fbCvCpuMs}{84}       % Farneback @480x640, ms/pair
-\newcommand{\tvlCvEpeGt}{0.149}   % TV-L1 EPE vs Middlebury GT
-\newcommand{\dfCvEpeGt}{0.084}    % DeepFlow EPE vs Middlebury GT
-% Pending (set the macro to the measured number; "TBD" renders as a gray
-% placeholder in tables and as a dashed bar in the chart automatically):
-\newcommand{\tvlCvCudaMs}{TBD}    % TV-L1  OpenCV CUDA, ms/pair
-\newcommand{\tvlTorchCpuMs}{TBD}  % TV-L1  torch CPU,   ms/pair
-\newcommand{\tvlTorchGpuMs}{TBD}  % TV-L1  torch CUDA (L40), ms/pair (batched)
-\newcommand{\dfTorchCpuMs}{TBD}   % DeepFlow torch CPU, ms/pair
-\newcommand{\dfTorchGpuMs}{TBD}   % DeepFlow torch CUDA (L40), ms/pair (batched)
-\newcommand{\tvlTorchEpeGt}{TBD}  % TV-L1  torch EPE vs GT
-\newcommand{\tvlTorchEpeCv}{TBD}  % TV-L1  torch EPE vs OpenCV reference
-\newcommand{\dfTorchEpeGt}{TBD}   % DeepFlow torch EPE vs GT
-\newcommand{\dfTorchEpeCv}{TBD}   % DeepFlow torch EPE vs OpenCV reference
+\newcommand{\tvlCvEpeGt}{0.208}   % TV-L1 cv2 EPE vs GT (final full-set eval)
+\newcommand{\dfCvEpeGt}{0.186}    % DeepFlow cv2 EPE vs GT (final full-set eval)
+% Final measured numbers (240x320, Middlebury, L40):
+\newcommand{\tvlCvCudaMs}{21.1}   % TV-L1 OpenCV CUDA, single pair, resident
+\newcommand{\tvlCvCudaStreamMs}{9.3} % 4 streams x 4 solver instances ceiling
+\newcommand{\tvlTorchCpuMs}{8300} % TV-L1  torch eager CPU, ms/pair
+\newcommand{\tvlTorchGpuMs}{5.5}  % TV-L1  torch CUDA: compile+early-exit, B=16
+\newcommand{\dfTorchCpuMs}{2263}  % DeepFlow torch eager CPU, ms/pair
+\newcommand{\dfTorchGpuMs}{16.0}  % DeepFlow torch CUDA: compile, B=64
+\newcommand{\dfTorchGpuFpMs}{7.4} % DeepFlow torch CUDA fp16, B=64
+\newcommand{\tvlTorchEpeGt}{0.208}% TV-L1 torch EPE vs GT (= cv2's own 0.208)
+\newcommand{\tvlTorchEpeCv}{0.027}% TV-L1 torch EPE vs OpenCV reference
+\newcommand{\dfTorchEpeGt}{0.186} % DeepFlow torch EPE vs GT (bit-identical to cv2)
+\newcommand{\dfTorchEpeCv}{0.000} % DeepFlow torch EPE vs OpenCV (~1e-6 px)
 % ==============================================================================
 
 % "TBD" -> gray italic in tables; numbers pass through.
 \newcommand{\pend}[1]{\ifthenelse{\equal{#1}{TBD}}{{\color{cmut}\itshape TBD}}{#1}}
 
-% Bar for the runtime chart: #1 x-center, #2 value macro (ms or TBD), #3 color.
-% Scale: 1 cm = 100 ms.
+% Bar for the runtime chart: #1 x-center, #2 value (ms), #3 color.
+% LOG scale: 1 cm per decade, baseline = 1 ms.
 \newcommand{\benchbar}[3]{%
-  \ifthenelse{\equal{#2}{TBD}}{%
-    \draw[dashed,#3,thick,fill=#3!10] (#1-0.3,0) rectangle (#1+0.3,0.9);
-    \node[above] at (#1,0.9) {\scriptsize\color{cmut}TBD};
-  }{%
-    \pgfmathsetmacro{\bh}{#2/100}%
-    \fill[#3,rounded corners=1.5pt] (#1-0.3,0) rectangle (#1+0.3,\bh);
-    \node[above] at (#1,\bh) {\scriptsize #2};
-  }}
+  \pgfmathsetmacro{\bh}{log10(#2)}%
+  \fill[#3,rounded corners=1.5pt] (#1-0.3,0) rectangle (#1+0.3,\bh);
+  \node[above] at (#1,\bh) {\scriptsize #2};}
+% Waterfall bar (log scale, 1.05 cm/decade): #1 x, #2 value, #3 color, #4 label.
+\newcommand{\wfbar}[4]{%
+  \pgfmathsetmacro{\bh}{log10(#2)*1.05}%
+  \fill[#3,rounded corners=1.5pt] (#1-0.42,0) rectangle (#1+0.42,\bh);
+  \node[above] at (#1,\bh) {\scriptsize\textbf{#2}};
+  \node[below,align=center,font=\tiny] at (#1,-0.08) {#4};}
 
 \title{Batched Dense Optical Flow in PyTorch\\[1ex]
   {\zhfont\large 批量稠密光流的 PyTorch 实现与基准测试}}
@@ -457,34 +459,43 @@
 % ------------------------------------------------------- 12 runtime table -----
 \begin{frame}{Runtime Results \zh{运行时间结果}}
   \centering
-  {\small Per-pair wall time, identical parameters across backends.
-   \textcolor{cmut}{\itshape TBD} = measurement in progress.}
+  {\small Per-pair wall time at $240{\times}320$ (Middlebury), identical
+   algorithm parameters across backends.}
   \par\medskip
-  \begin{tabular}{@{}llrrrr@{}}
+  \begin{tabular}{@{}lrrrr@{}}
     \toprule
-    Algorithm & Size & \textcolor{cblue}{cv CPU} & \textcolor{corange}{cv CUDA}
+    Algorithm & \textcolor{cblue}{cv CPU} & \textcolor{corange}{cv CUDA}
       & \textcolor{caqua!70!black}{torch CPU} & \textcolor{cyellow!70!black}{torch CUDA (L40)} \\
     \midrule
-    TV-L1    & $240{\times}320$ & \tvlCvCpuMs\,ms (\tvlCvCpuFps\,FPS)
-             & \pend{\tvlCvCudaMs} & \pend{\tvlTorchCpuMs} & \pend{\tvlTorchGpuMs} \\
-    DeepFlow & $240{\times}320$ & \dfCvCpuMs\,ms (\dfCvCpuFps\,FPS)
-             & --- (none) & \pend{\dfTorchCpuMs} & \pend{\dfTorchGpuMs} \\
-    Farneback & $480{\times}640$ & \fbCvCpuMs\,ms & --- & --- & --- \\
+    TV-L1    & \tvlCvCpuMs\,ms (\tvlCvCpuFps\,FPS)
+             & \tvlCvCudaMs\,ms$^{a}$ & \tvlTorchCpuMs\,ms
+             & \textbf{\tvlTorchGpuMs\,ms}$^{b}$ \\
+    DeepFlow & \dfCvCpuMs\,ms (\dfCvCpuFps\,FPS)
+             & --- (none) & \dfTorchCpuMs\,ms
+             & \textbf{\dfTorchGpuMs\,ms}$^{c}$ (fp16: \dfTorchGpuFpMs) \\
+    Farneback & \fbCvCpuMs\,ms @$480{\times}640$ & --- & --- & --- \\
     \bottomrule
   \end{tabular}
-  \par\medskip
-  \begin{itemize}
-    \item CPU numbers from the 48-core login node --- but these algorithms
-      \textbf{barely parallelize} in OpenCV: Farneback single-thread vs
-      48-thread is 85 vs 84\,ms. Cores don't help; batching must.
-    \item torch CUDA column is \textbf{batched} throughput
-      (time per pair $=$ batch time $/ B$).
+  \par\smallskip
+  {\scriptsize $^{a}$single pair, GPU-resident; \tvlCvCudaStreamMs\,ms with
+   4 streams $\times$ 4 solver instances; needs custom CUDA 12.9 OpenCV build.\quad
+   $^{b}$\texttt{torch.compile} + adaptive early exit, $B{=}16$.\quad
+   $^{c}$\texttt{torch.compile}, $B{=}64$; per pair $=$ batch time $/B$.}
+  \par\smallskip
+  \begin{itemize}\itemsep1pt
+    \item Multicore doesn't help OpenCV here (Farneback 1 vs 48 threads: 85 vs
+      84\,ms); torch \emph{eager} CPU is even slower --- as expected, per-op
+      overhead without fusion.
+    \item Batched torch CUDA: \textbf{76$\times$} over OpenCV CPU (TV-L1) and
+      \textbf{1.7$\times$ faster than cv2.cuda's 4-stream ceiling} while
+      computing the \emph{full} algorithm.
   \end{itemize}
   \vfill
   \begin{cn}
-    OpenCV CPU 已确认：TV-L1 每对 424 毫秒、DeepFlow 346 毫秒（$240\times320$）。
-    48 核几乎不加速（Farneback 单线程 85 ms vs 48 线程 84 ms）——多核帮不上忙，
-    必须靠批量化。torch CPU/GPU 数据测量中（表中 TBD 一处修改即可全局填入）。
+    最终结果：TV-L1 torch CUDA 每对 5.5 ms（compile + 自适应提前退出，$B{=}16$），
+    比 OpenCV CPU 快约 76 倍，比 cv2.cuda 四流并发上限（9.3 ms）还快 1.7 倍；
+    DeepFlow 16.0 ms（fp16 为 7.4 ms）。torch eager CPU 反而更慢——符合预期，
+    逐算子开销大且无融合。
   \end{cn}
 \end{frame}
 
@@ -492,41 +503,181 @@
 \begin{frame}{Runtime Chart \zh{运行时间对比图}}
   \centering
   \begin{tikzpicture}[scale=0.95]
-    % axis + grid (1 cm = 100 ms)
-    \foreach \y in {1,2,3,4}{
-      \draw[cmut!25] (0.3,\y) -- (7.6,\y);
-      \node[left,font=\scriptsize,color=cmut] at (0.3,\y) {\y00};}
-    \node[left,font=\scriptsize,color=cmut] at (0.3,0) {0};
-    \draw[cmut] (0.3,0) -- (7.6,0);
-    \node[rotate=90,font=\scriptsize,color=cmut] at (-0.55,2.3) {ms / pair @ $240{\times}320$};
+    % log axis: 1 cm per decade, baseline 1 ms
+    \foreach \y/\l in {0/1, 1/10, 2/100, 3/1000, 4/10^4}{
+      \draw[cmut!25] (0.3,\y) -- (8.4,\y);
+      \node[left,font=\scriptsize,color=cmut] at (0.3,\y) {$\l$};}
+    \draw[cmut] (0.3,0) -- (8.4,0);
+    \node[rotate=90,font=\scriptsize,color=cmut] at (-0.65,2.0)
+      {ms / pair @ $240{\times}320$ (log)};
     % TV-L1 group
     \benchbar{1.0}{\tvlCvCpuMs}{cblue}
     \benchbar{1.75}{\tvlCvCudaMs}{corange}
     \benchbar{2.5}{\tvlTorchCpuMs}{caqua}
     \benchbar{3.25}{\tvlTorchGpuMs}{cyellow}
-    \node[below,font=\small] at (2.1,-0.25) {TV-L1};
+    \node[below,font=\small] at (2.1,-0.3) {TV-L1};
     % DeepFlow group (no cv CUDA)
     \benchbar{5.0}{\dfCvCpuMs}{cblue}
     \benchbar{5.75}{\dfTorchCpuMs}{caqua}
     \benchbar{6.5}{\dfTorchGpuMs}{cyellow}
-    \node[below,font=\small] at (5.75,-0.25) {DeepFlow \scriptsize(no cv CUDA)};
+    \benchbar{7.25}{\dfTorchGpuFpMs}{cyellow!45}
+    \node[below,font=\small] at (6.1,-0.3) {DeepFlow \scriptsize(no cv CUDA)};
     % legend
-    \begin{scope}[shift={(8.4,2.4)}]
-      \foreach \c/\t/\yy in {cblue/OpenCV CPU/1.6, corange/OpenCV CUDA/1.1,
-                             caqua/torch CPU/0.6, cyellow/torch CUDA (L40)/0.1}{
+    \begin{scope}[shift={(9.2,1.7)}]
+      \foreach \c/\t/\yy in {cblue/OpenCV CPU/2.0, corange/OpenCV CUDA/1.5,
+                             caqua/torch CPU (eager)/1.0,
+                             cyellow/torch CUDA (L40)/0.5,
+                             cyellow!45/torch CUDA fp16 ($B{=}64$)/0.0}{
         \fill[\c,rounded corners=1pt] (0,\yy) rectangle ++(0.32,0.32);
         \node[right,font=\scriptsize] at (0.4,\yy+0.16) {\t};}
-      \draw[dashed,cmut,fill=cmut!8] (0,-0.4) rectangle ++(0.32,0.32);
-      \node[right,font=\scriptsize,color=cmut] at (0.4,-0.24) {TBD (pending)};
     \end{scope}
   \end{tikzpicture}
   \par\smallskip
-  {\scriptsize Dashed bars: measurements pending; heights will update
-  automatically from the placeholder macros.}
+  {\scriptsize Log scale --- each gridline is $10\times$. torch CUDA spans
+   3 orders of magnitude below torch eager CPU.}
   \vfill
   \begin{cn}
-    实心柱为已确认的 OpenCV CPU 结果；虚线柱为待测的 torch CPU / torch CUDA
-    与 OpenCV CUDA 结果，数值填入宏后柱高自动更新。
+    对数坐标（每格 10 倍）：torch CUDA（黄）在两种算法上都比 OpenCV CPU 低约
+    两个数量级；TV-L1 上也低于 cv2.cuda（橙）。torch eager CPU（绿）最慢，
+    印证瓶颈在逐算子开销而非算力。
+  \end{cn}
+\end{frame}
+
+% ------------------------------------------------- 14 ablation waterfall ------
+\begin{frame}{Optimization Waterfall: TV-L1 on L40 \zh{优化阶梯}}
+  \centering
+  \begin{tikzpicture}[scale=0.98,font=\scriptsize]
+    % reference lines (log scale, 1.05 cm/decade)
+    \pgfmathsetmacro{\ycv}{log10(419)*1.05}
+    \pgfmathsetmacro{\ystream}{log10(9.3)*1.05}
+    \draw[dashed,cmut] (0.1,\ycv) -- (8.6,\ycv)
+      node[right,color=cmut]{OpenCV CPU 419 ms};
+    \draw[dashed,corange!80!black] (0.1,\ystream) -- (8.6,\ystream)
+      node[right,color=corange!80!black]{cv2.cuda 4-stream ceiling 9.3 ms};
+    % bars: eager -> compile -> -cat -> median net -> early exit
+    \wfbar{1.0}{248}{cblue!90}{torch eager\\GPU}
+    \wfbar{2.6}{53.2}{cblue!70}{\texttt{torch.compile}}
+    \wfbar{4.2}{46.5}{cblue!55}{$-$ \texttt{cat}/\texttt{stack}\\removal}
+    \wfbar{5.8}{29.2}{cblue!40}{median $\to$\\selection network}
+    \wfbar{7.4}{5.5}{caqua}{$+$ adaptive\\early exit}
+    % step factors between consecutive bar tops
+    \foreach \x/\y/\f in {1.8/2.25/$\times$4.7, 3.4/1.95/$\times$1.14,
+                          5.0/1.85/$\times$1.6, 6.6/1.70/$\times$5.3}{
+      \node[color=cmut] at (\x,\y) {\f};
+      \draw[->,cmut] (\x-0.3,\y-0.16) -- (\x+0.3,\y-0.16);}
+    \draw[cmut] (0.1,0) -- (8.6,0);
+    \node[rotate=90,color=cmut] at (-0.35,1.4) {ms / pair (log)};
+  \end{tikzpicture}
+  \par
+  {\small $240{\times}320$, $B{=}16$: \textbf{9.6$\times$} over plain compile,
+   \textbf{45$\times$} over eager, \textbf{76$\times$} over OpenCV CPU.}
+  \begin{itemize}\itemsep0pt\small
+    \item Median filter was 47\% of GPU time $\to$ replaced by a 202-op
+      min/max \textbf{selection network} (18$\times$ on that kernel).
+    \item Early exit $=$ OpenCV's own throttled-sync scheme ---
+      \emph{bit-for-bit result-neutral}.
+    \item CUDA graphs variant works, but per-step clones make it
+      $\sim$2$\times$ slower than \texttt{torch.compile} --- compile wins.
+  \end{itemize}
+  \vfill
+  \begin{cn}
+    eager 248 $\to$ compile 53.2 $\to$ 去 cat/stack 46.5 $\to$
+    中值滤波改选择网络 29.2 $\to$ 自适应提前退出 5.5 ms（与 OpenCV 同款方案，
+    结果逐位不变）；CUDA graphs 因逐步克隆反而慢约 2 倍。
+  \end{cn}
+\end{frame}
+
+% ------------------------------------------------- 15 cv2.cuda baseline -------
+\begin{frame}{How Strong Is the cv2.cuda Baseline? \zh{cv2.cuda 基线有多强}}
+  \begin{itemize}\itemsep2pt
+    \item \textbf{Single pair, GPU-resident: 21.1 ms} --- but only
+      \textbf{42--47\% utilization} on the L40: launch-latency-bound even with
+      data resident.
+    \item Best scaling we achieved: \textbf{4 CUDA streams $\times$ 4 solver
+      instances $\to$ 9.3 ms/pair} (92\% util) --- 2.3$\times$, not 4$\times$.
+    \item OpenCV's CUDA TV-L1 is a \textbf{lighter variant} of its CPU
+      algorithm (per OpenCV's own parity test): \emph{no median filtering},
+      real early exit, bicubic $a{=}{-}0.5$ vs $-0.75$.
+    \item Our \textbf{5.5 ms computes the full CPU algorithm} (median filter
+      included) and still beats the 4-stream ceiling by
+      \textbf{1.7$\times$}.
+    \item \textbf{DeepFlow}: OpenCV has \emph{no} GPU version at all
+      (\texttt{cudaoptflow} $=$ \{brox, farneback, nvof, pyrlk, tvl1\} only).
+      Our 16.0 ms (fp16: 7.4) vs their CPU 297 ms $=$
+      \textbf{18.6$\times$} (fp16: \textbf{40$\times$}) over the only
+      implementation that exists.
+  \end{itemize}
+  \vfill
+  \begin{cn}
+    cv2.cuda 单对 21.1 ms 时利用率仅 42--47\%（核启动延迟受限）；四流并发上限
+    9.3 ms（92\% 利用率，2.3 倍而非 4 倍）。且其 CUDA 版是\textbf{简化变体}：
+    无中值滤波、真提前退出、双三次 $a{=}{-}0.5$。我们的 5.5 ms 计算\textbf{完整}
+    算法仍快 1.7 倍；DeepFlow 则完全没有 OpenCV GPU 版，16.0 ms（fp16 7.4）
+    对其 CPU 297 ms 为 18.6 倍（fp16 40 倍）。
+  \end{cn}
+\end{frame}
+
+% ------------------------------------------- 16 multi-resolution + util -------
+\begin{frame}{Scaling with Resolution \& GPU Utilization \zh{分辨率扩展与利用率}}
+  \centering
+  {\small \texttt{torch.compile}, best batch size per resolution
+   (TV-L1 numbers \emph{pre-early-exit}; early exit adds another
+   $\sim$5$\times$ at $240{\times}320$).}
+  \par\smallskip
+  {\footnotesize
+  \begin{tabular}{@{}lrrrr@{\qquad}rrrr@{}}
+    \toprule
+    & \multicolumn{4}{c}{TV-L1} & \multicolumn{4}{c}{DeepFlow} \\
+    \cmidrule(r{2em}){2-5}\cmidrule{6-9}
+    Resolution & $B$ & ms/pair & util & vs cv CPU
+               & $B$ & ms/pair & util & vs cv CPU \\
+    \midrule
+    $240{\times}320$  & 16 & 54.5 & 85\% & 7.7$\times$ & 64 & 16.0 & 73\% & 18.6$\times$ \\
+    $480{\times}640$  &  4 & 224  & 86\% & 4.9$\times$ & 16 & 71.7 & 67\% & 8.8$\times$ \\
+    $480{\times}854$  &  4 & 323  & 91\% & 4.4$\times$ & 16 & 99.4 & 73\% & 7.5$\times$ \\
+    $720{\times}1280$ &  2 & 733  & 92\% & 4.2$\times$ &  8 & 236.7 & 76\% & 5.5$\times$ \\
+    \bottomrule
+  \end{tabular}}
+  \par\medskip
+  \begin{itemize}\itemsep1pt
+    \item Saturation batch size falls $\sim 1/\text{pixels}$: once the GPU is
+      full, bigger $B$ stops helping.
+    \item \textbf{L2-residency cliff}: working set $\approx 3.7$\,MB$\times B$
+      vs 96\,MB L2 predicts the optima ($B{=}16$ @240p, $B{=}4$ @VGA)
+      \emph{exactly}.
+    \item 99\% ``utilization'' $\ne$ efficient --- SMs counted busy while
+      waiting on DRAM.
+  \end{itemize}
+  \vfill
+  \begin{cn}
+    最优批大小随像素数近似反比下降；\textbf{L2 驻留悬崖}：工作集
+    $\approx 3.7\,\mathrm{MB}\times B$ 对 96 MB L2，恰好预测出 240p 的
+    $B{=}16$ 与 VGA 的 $B{=}4$。注意高“利用率”不等于高效——SM 在等 DRAM
+    时也被计为忙。TV-L1 列为未加提前退出的数字（240p 上提前退出再提速约 5 倍）。
+  \end{cn}
+\end{frame}
+
+% ------------------------------------------------------ 17 precision ----------
+\begin{frame}{Precision Study: fp16, bf16, TF32 \zh{数值精度研究}}
+  \begin{itemize}\itemsep2pt
+    \item \textbf{fp16 $>$ bf16 for iterative solvers} --- mantissa matters
+      (11 vs 8 bits): DeepFlow bf16 $+74\%$ EPE; fp16 only $+0.003$\,px.
+    \item fp16 pays off \textbf{only at large $B$} (bandwidth-bound regime):
+      TV-L1 \textbf{1.75$\times$}, DeepFlow \textbf{2.10$\times$} at $B{=}64$;
+      at small $B$ (launch/latency-bound) it buys nothing.
+    \item \textbf{TF32 / autocast are no-ops} here --- these solvers contain
+      no matmuls; everything is elementwise/stencil.
+    \item \textbf{Keep the 0..255 intensity scale}: rescaling images to 0..1
+      silently breaks both solvers' tuned thresholds
+      (TV-L1 EPE $0.21 \to 1.46$).
+  \end{itemize}
+  \vfill
+  \begin{cn}
+    迭代求解器更吃尾数位：bf16（8 位尾数）使 DeepFlow EPE 恶化 74\%，而
+    fp16（11 位）仅差 0.003 px。fp16 只在大批量（带宽受限区）才有收益
+    （$B{=}64$：TV-L1 1.75 倍、DeepFlow 2.10 倍）；TF32/autocast 无效
+    （没有矩阵乘）。务必保持 0..255 灰度尺度——归一化到 0..1 会破坏两个
+    算法的阈值（TV-L1 EPE 从 0.21 恶化到 1.46）。
   \end{cn}
 \end{frame}
 
@@ -541,56 +692,83 @@
     Algorithm & Backend & EPE vs.\ GT & EPE vs.\ OpenCV ref. \\
     \midrule
     TV-L1    & OpenCV CPU & \tvlCvEpeGt & (reference) \\
-    TV-L1    & torch      & \pend{\tvlTorchEpeGt} & \pend{\tvlTorchEpeCv} \\
+    TV-L1    & torch      & \tvlTorchEpeGt & \tvlTorchEpeCv \\
     \midrule
     DeepFlow & OpenCV CPU & \dfCvEpeGt & (reference) \\
-    DeepFlow & torch      & \pend{\dfTorchEpeGt} & \pend{\dfTorchEpeCv} \\
+    DeepFlow & torch      & \dfTorchEpeGt & \dfTorchEpeCv$^{*}$ \\
     \bottomrule
   \end{tabular}
-  \par\medskip
+  \par\smallskip
+  {\scriptsize $^{*}$$\approx 10^{-6}$\,px --- the DeepFlow port is
+   \textbf{bit-identical} to OpenCV.}
+  \par\smallskip
   \begin{itemize}
-    \item DeepFlow's variational part is already notably more accurate than
-      TV-L1 here (0.084 vs 0.149 EPE).
-    \item ``EPE vs.\ OpenCV ref.''\ measures \textbf{faithfulness of the
-      reimplementation} (target $\ll$ EPE vs.\ GT); small differences expected
-      from interpolation/boundary choices.
+    \item \textbf{Full fidelity}: torch matches OpenCV's own GT accuracy
+      exactly (TV-L1: 0.208 both); the 0.027\,px TV-L1 gap vs the reference
+      comes from interpolation/boundary choices only.
+    \item DeepFlow's variational part remains the more accurate algorithm
+      (0.186 vs 0.208 EPE) --- and our port reproduces it to the bit.
   \end{itemize}
   \vfill
   \begin{cn}
-    以 Middlebury 真值计算平均端点误差（EPE）：DeepFlow（0.084）明显优于
-    TV-L1（0.149）。“vs.\ OpenCV”一列衡量我们复现实现与 OpenCV 的一致性，
-    目标是远小于对真值的误差；插值与边界处理会带来微小差异。torch 数据待填。
+    精度结论：torch 版与 OpenCV 对真值的 EPE 完全一致（TV-L1 双方均 0.208）；
+    与 OpenCV 参考流场相比，TV-L1 差 0.027 px（仅插值/边界差异），DeepFlow
+    则\textbf{逐位一致}（差约 $10^{-6}$ px）。DeepFlow（0.186）仍比
+    TV-L1（0.208）更准。
+  \end{cn}
+\end{frame}
+
+% ------------------------------------------------------ 19 video pipeline -----
+\begin{frame}{End-to-End Video Pipeline \zh{端到端视频管线}}
+  \begin{itemize}\itemsep2pt
+    \item Video decode $\to$ chunked batches $\to$ flow on GPU:
+      \textbf{transfers are $<2\%$} of end-to-end runtime --- compute-bound,
+      as designed.
+    \item Best chunk size: \textbf{16 frames (TV-L1)}, \textbf{32 frames
+      (DeepFlow)}.
+    \item Sustained throughput at $240{\times}320$ on \emph{one} L40:
+      $\sim$\textbf{180 FPS TV-L1} (with early exit),
+      $\sim$\textbf{67 FPS DeepFlow} (fp16: \textbf{135 FPS}).
+    \item Footprint $<1.7$\,GB $\Rightarrow$ multiple video streams can share
+      a single GPU.
+  \end{itemize}
+  \vfill
+  \begin{cn}
+    视频解码 $\to$ 分块成批 $\to$ GPU 光流：数据搬运占端到端时间不到 2\%。
+    最优块长 TV-L1 为 16 帧、DeepFlow 为 32 帧。单张 L40 在 $240\times320$
+    下约 180 FPS（TV-L1，含提前退出）、67 FPS（DeepFlow；fp16 达 135 FPS），
+    显存占用低于 1.7 GB，可多路视频共享一卡。
   \end{cn}
 \end{frame}
 
 % -------------------------------------------------------- 15 conclusions ------
 \begin{frame}{Conclusions \& Practical Notes \zh{结论与实用备注}}
   \textbf{Conclusions}
-  \begin{itemize}\itemsep1pt
-    \item Variational flow is iteration-heavy and core-count-insensitive; the
-      viable route to throughput is \textbf{batching}, which OpenCV's APIs
-      (CPU or CUDA) do not offer.
-    \item A pure-torch rewrite gives batching, GPU support without custom
-      OpenCV builds, one code path for CPU/GPU, and pipeline composability.
-    \item Red-black reordering is the key trick that makes SOR-style solvers
-      tensor-friendly.
+  \begin{itemize}\itemsep0pt
+    \item Batching $+$ \texttt{torch.compile} $+$ \textbf{algorithm-level
+      porting} (median $\to$ selection network, adaptive early exit)
+      \textbf{beats even a hand-written CUDA baseline} (5.5 vs 9.3\,ms
+      4-stream ceiling) --- at \emph{full} fidelity (DeepFlow bit-identical).
+    \item OpenCV-CUDA's own tricks \textbf{transfer cleanly to torch}: kernel
+      fusion via compile, \texttt{calcError}-style split, adaptive/throttled
+      sync.
+    \item Red-black reordering makes SOR tensor-friendly; the L2-residency
+      rule picks the batch size per resolution.
   \end{itemize}
-  \smallskip
   \textbf{Practical notes}
-  \begin{itemize}\itemsep1pt
-    \item Env: \texttt{uv} project; use
-      \texttt{opencv-contrib-python-headless} on compute nodes (no GUI libs).
+  \begin{itemize}\itemsep0pt
+    \item Env: \texttt{uv} project; \texttt{opencv-contrib-python-headless}
+      on compute nodes (no GUI libs); login node has no GPU ---
+      the benchmark script auto-skips unavailable backends.
     \item GPU runs via SLURM: {\footnotesize
       \texttt{srun -p gpu -w ilps-cn119 --gres=gpu:1 --cpus-per-task=8
       --mem=16G uv run --no-sync python benchmark.py}}
-    \item Login node has no GPU: CPU backends only; benchmark script
-      auto-skips unavailable backends.
   \end{itemize}
   \vfill
   \begin{cn}
-    结论：变分光流迭代多、对核数不敏感，吞吐量的正确路径是\textbf{批量化}；
-    纯 torch 重写免去 OpenCV 自编译、CPU/GPU 一套代码、可组合进现有管线。
-    实用：用 \texttt{uv} 管理环境，计算节点装 headless 版 OpenCV，GPU 作业经
+    批量化 + \texttt{torch.compile} + 算法级移植在保持完整保真度的同时
+    胜过手写 CUDA 基线（5.5 对 9.3 ms）；OpenCV-CUDA 的技巧可干净迁移到
+    torch。实用：\texttt{uv} 管环境，计算节点用 headless OpenCV，GPU 作业经
     SLURM 提交至 ilps-cn119。
   \end{cn}
 \end{frame}
