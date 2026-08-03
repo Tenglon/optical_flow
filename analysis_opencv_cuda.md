@@ -645,7 +645,16 @@ fair comparisons are:
 | **Statefulness / thread-safety** | ❌ 15 mutable member buffers; `nscales_ = s` mutates config permanently (`tvl1flow.cpp:236`) | ✅ pure function | ✅ pure (module-level compile cache only) |
 | **LOC / build** | ≈ 850 lines, 3 files, C++ + CUDA, nvcc + module rebuild | **544 lines, 1 file** | same |
 | **Extensibility** | new kernel + host wrapper + interface change + ABI break | ✅ edit a Python function | ✅ same (recompile is automatic) |
-| **Best measured (240×320)** | **21.1 ms/pair** resident B=1 (42 % util); **9.3 ms/pair** with 4 streams (92 % util) — lighter algorithm variant, see §5.5 | 172.3 ms/pair @ B=64 | **54.5 ms/pair @ B=16** (85 % util) |
+| **Best measured (240×320)** | **21.1 ms/pair** resident B=1 (42 % util); **9.3 ms/pair** with 4 streams (92 % util) — lighter algorithm variant, see §5.5 | 172.3 ms/pair @ B=64 | **54.5 ms/pair @ B=16** (85 % util); with early-exit port 5.5; with hand-written Triton kernels (`backend="triton"`, 2 launches/iter) **3.16 ms/pair** |
+
+**Postscript (measured after this analysis).** The techniques recommended here were implemented:
+the median selection network + OpenCV-style adaptive early exit took compile from 54.5 to
+5.5 ms/pair @240x320, and a hand-written 2-kernel Triton port of the estimateU/estimateDual
+split (`triton_tvl1.py`, batched, deterministic tiled reduction) reached exactly OpenCV's
+2 launches/iteration and 1.34–2.0x over Inductor everywhere: **3.16 ms** @240x320 (2.9x under
+cv2.cuda's 4-stream ceiling), 14.1 @480x640, 15.5 @480x854, **33.2 ms @720x1280 — under
+cv2.cuda's 35.8 ms single-pair figure while keeping the median filtering they skip** (their
+4-stream ceiling 21.6 remains 1.54x ahead at 720p).
 
 ### Bottom line
 

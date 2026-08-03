@@ -554,36 +554,42 @@
       node[right,color=cmut]{OpenCV CPU 419 ms};
     \draw[dashed,corange!80!black] (0.1,\ystream) -- (8.6,\ystream)
       node[right,color=corange!80!black]{cv2.cuda 4-stream ceiling 9.3 ms};
-    % bars: eager -> compile -> -cat -> median net -> early exit
+    % bars: eager -> compile -> -cat -> median net -> early exit -> triton
     \wfbar{1.0}{248}{cblue!90}{torch eager\\GPU}
-    \wfbar{2.6}{53.2}{cblue!70}{\texttt{torch.compile}}
-    \wfbar{4.2}{46.5}{cblue!55}{$-$ \texttt{cat}/\texttt{stack}\\removal}
-    \wfbar{5.8}{29.2}{cblue!40}{median $\to$\\selection network}
-    \wfbar{7.4}{5.5}{caqua}{$+$ adaptive\\early exit}
+    \wfbar{2.4}{53.2}{cblue!70}{\texttt{torch.compile}}
+    \wfbar{3.8}{46.5}{cblue!55}{$-$ \texttt{cat}/\texttt{stack}\\removal}
+    \wfbar{5.2}{29.2}{cblue!40}{median $\to$\\selection network}
+    \wfbar{6.6}{5.5}{cblue!25}{$+$ adaptive\\early exit}
+    \wfbar{8.0}{3.16}{caqua}{Triton\\2-kernel}
     % step factors between consecutive bar tops
-    \foreach \x/\y/\f in {1.8/2.25/$\times$4.7, 3.4/1.95/$\times$1.14,
-                          5.0/1.85/$\times$1.6, 6.6/1.70/$\times$5.3}{
+    \foreach \x/\y/\f in {1.7/2.25/$\times$4.7, 3.1/1.95/$\times$1.14,
+                          4.5/1.87/$\times$1.6, 5.9/1.72/$\times$5.3,
+                          7.3/1.02/$\times$1.7}{
       \node[color=cmut] at (\x,\y) {\f};
       \draw[->,cmut] (\x-0.3,\y-0.16) -- (\x+0.3,\y-0.16);}
-    \draw[cmut] (0.1,0) -- (8.6,0);
+    \draw[cmut] (0.1,0) -- (8.9,0);
     \node[rotate=90,color=cmut] at (-0.35,1.4) {ms / pair (log)};
   \end{tikzpicture}
   \par
-  {\small $240{\times}320$, $B{=}16$: \textbf{9.6$\times$} over plain compile,
-   \textbf{45$\times$} over eager, \textbf{76$\times$} over OpenCV CPU.}
-  \begin{itemize}\itemsep0pt\small
+  {\footnotesize $240{\times}320$, $B{=}16$: \textbf{16.8$\times$} over plain
+   compile, \textbf{78$\times$} over eager, \textbf{133$\times$} over OpenCV
+   CPU --- the cv2.cuda 4-stream line is now \textbf{crossed}.}
+  \begin{itemize}\itemsep0pt\scriptsize
     \item Median filter was 47\% of GPU time $\to$ replaced by a 202-op
       min/max \textbf{selection network} (18$\times$ on that kernel).
     \item Early exit $=$ OpenCV's own throttled-sync scheme ---
-      \emph{bit-for-bit result-neutral}.
-    \item CUDA graphs variant works, but per-step clones make it
-      $\sim$2$\times$ slower than \texttt{torch.compile} --- compile wins.
+      \emph{bit-for-bit result-neutral}. (CUDA graphs variant:
+      $\sim$2$\times$ slower than compile, per-step clones.)
+    \item Final step: \textbf{2 hand-written Triton kernels} for the inner
+      step --- exactly \textbf{2.00 launches/iteration} vs Inductor's 6.00;
+      median filtering \emph{kept}; EPE vs cv2 0.0263 (compile's noise floor).
   \end{itemize}
   \vfill
   \begin{cn}
-    eager 248 $\to$ compile 53.2 $\to$ 去 cat/stack 46.5 $\to$
-    中值滤波改选择网络 29.2 $\to$ 自适应提前退出 5.5 ms（与 OpenCV 同款方案，
-    结果逐位不变）；CUDA graphs 因逐步克隆反而慢约 2 倍。
+    eager 248 $\to$ compile 53.2 $\to$ 去 cat/stack 46.5 $\to$ 选择网络 29.2
+    $\to$ 提前退出 5.5 $\to$ \textbf{手写 Triton 双核 3.16 ms}（每迭代恰 2 次
+    核启动，Inductor 为 6 次；保留中值滤波）。合计快 OpenCV CPU 133 倍，
+    已越过 cv2.cuda 四流上限。
   \end{cn}
 \end{frame}
 
@@ -603,57 +609,62 @@
       \textbf{18.6$\times$} (fp16: \textbf{40$\times$}).
   \end{itemize}
   \centering
-  {\footnotesize TV-L1 head-to-head, ms/pair:\quad
+  {\footnotesize TV-L1 head-to-head, ms/pair (fp32):\quad
   \begin{tabular}{@{}lrrrr@{}}
     \toprule
     & \multicolumn{2}{c}{cv2.cuda (variant)} & \multicolumn{2}{c}{ours (full algo)} \\
     \cmidrule(lr){2-3}\cmidrule(lr){4-5}
-    Resolution & 1 pair & 4-stream & fp32 & fp16 \\
+    Resolution & 1 pair & 4-stream & compile & \textbf{Triton} \\
     \midrule
-    $240{\times}320$  & 21.1 & 9.3  & \textbf{5.5} & --- \\
-    $480{\times}640$  & 26.5 & 13.1 & 22.6 & 15.2 \\
-    $480{\times}854$  & 27.2 & 14.0 & 27.3 & 19.0 \\
-    $720{\times}1280$ & 35.8 & \textbf{21.6} & 62.0 & 41.9 \\
+    $240{\times}320$  & 21.1 & 9.3  & 5.5  & \textbf{3.16} \\
+    $480{\times}640$  & 26.5 & 13.1 & 22.6 & \textbf{14.1} \\
+    $480{\times}854$  & 27.2 & 14.0 & 27.3 & \textbf{15.5} \\
+    $720{\times}1280$ & 35.8 & 21.6 & 62.0 & \textbf{33.2} \\
     \bottomrule
   \end{tabular}}
   \par\smallskip
-  {\footnotesize\itshape Honest verdict: full-fidelity torch beats their
-   single-pair baseline up to $\sim$480p and matches their 4-stream ceiling
-   with fp16; at 720p their hand-fused kernels win 1.7--1.9$\times$ --- once
-   one pair saturates the GPU, the per-iteration DRAM advantage decides, and
-   batching no longer compensates.}
+  {\footnotesize\itshape Verdict: hand-fusion was the remaining gap, and
+   porting OpenCV's own 2-kernel split to Triton closes it --- 2.9$\times$
+   past their 4-stream ceiling at 240p, at parity with it at 480p, and at
+   720p we now come in \textbf{under their single-pair figure} while doing the
+   median filtering they skip. Only their 4-stream ensemble stays ahead
+   (1.54$\times$).}
   \vfill
   \begin{cn}
     cv2.cuda 单对利用率仅 42--47\%，四流上限 2.3 倍；其 CUDA 版为简化变体。
-    对比结论：全保真 torch 在 $\le$480p 胜其单对基线，fp16 可追平其四流上限；
-    720p 时其手写融合核反超 1.7--1.9 倍——单对已喂饱 GPU 后带宽差距起决定
-    作用，批量化不再能补偿。
+    结论：此前唯一的差距在手写核融合，把 OpenCV 的\textbf{双核拆分}移植到
+    Triton 后已被补上——240p 超其四流上限 2.9 倍，480p 与之持平，720p 更是在
+    \textbf{保留其省略的中值滤波}前提下低于其单对成绩；仅其四流并发仍领先
+    1.54 倍。
   \end{cn}
 \end{frame}
 
 % ------------------------------------------- 16 multi-resolution + util -------
 \begin{frame}{Scaling with Resolution \& GPU Utilization \zh{分辨率扩展与利用率}}
   \centering
-  {\small ms/pair, \texttt{torch.compile} $+$ adaptive early exit (TV-L1),
-   best batch size per resolution.}
+  {\small ms/pair, adaptive early exit (TV-L1), best batch size per
+   resolution.}
   \par
   {\footnotesize
-  \begin{tabular}{@{}lrrr@{\qquad}rrr@{}}
+  \begin{tabular}{@{}lrrrr@{\qquad}rrr@{}}
     \toprule
-    & \multicolumn{3}{c}{TV-L1} & \multicolumn{3}{c}{DeepFlow} \\
-    \cmidrule(r{2em}){2-4}\cmidrule{5-7}
-    Resolution & $B$ & fp32 & fp16$^{a}$ & $B$ & fp32 & fp16 \\
+    & \multicolumn{4}{c}{TV-L1} & \multicolumn{3}{c}{DeepFlow} \\
+    \cmidrule(r{2em}){2-5}\cmidrule{6-8}
+    Resolution & $B$ & compile & \textbf{Triton}$^{a}$ & fp16$^{b}$
+               & $B$ & fp32 & fp16 \\
     \midrule
-    $240{\times}320$  & 16 & \textbf{5.5} & ---  & 64 & 16.0  & \textbf{7.4} \\
-    $480{\times}640$  &  4 & 22.6 & 15.2 & 16 & 71.7  & 39.5 \\
-    $480{\times}854$  &  4 & 27.3 & 19.0 & 16 & 99.4  & 49.1 \\
-    $720{\times}1280$ &  2 & 62.0 & 41.9 &  8 & 236.7 & ---$^{b}$ \\
+    $240{\times}320$  & 16 & 5.5  & \textbf{3.16} & 2.17 & 64 & 16.0  & \textbf{7.4} \\
+    $480{\times}640$  &  4 & 22.6 & \textbf{14.1} & 15.2 & 16 & 71.7  & 39.5 \\
+    $480{\times}854$  &  4 & 27.3 & \textbf{15.5} & 19.0 & 16 & 99.4  & 49.1 \\
+    $720{\times}1280$ &  2 & 62.0 & \textbf{33.2} & 41.9 &  8 & 236.7 & ---$^{c}$ \\
     \bottomrule
   \end{tabular}}
   \par\smallskip
-  {\scriptsize $^{a}$fp16 at doubled batch ($B{=}8/8/4$) --- half the working
-   set, so the optimal $B$ doubles.\quad
-   $^{b}$DeepFlow fp16 \textbf{overflows (NaN) at 720p} --- use fp32 there.}
+  {\scriptsize $^{a}$new best: 2 Triton kernels, fp32 $+$ early exit,
+   1.34--2.0$\times$ over compile everywhere.\quad
+   $^{b}$fp16 (compile) at doubled batch --- half the working set, so the
+   optimal $B$ doubles.\quad
+   $^{c}$DeepFlow fp16 \textbf{overflows (NaN) at 720p} --- use fp32 there.}
   \par
   \begin{itemize}\itemsep1pt\small
     \item Saturation batch size falls $\sim 1/\text{pixels}$: once the GPU is
@@ -666,7 +677,8 @@
   \end{itemize}
   \vfill
   \begin{cn}
-    表为最终（含提前退出）数字。最优批大小随像素数近似反比下降；
+    Triton 列为最新最佳（各分辨率较 compile 快 1.34--2.0 倍）。
+    最优批大小随像素数近似反比下降；
     \textbf{L2 驻留悬崖}：工作集 $\approx 3.7\,\mathrm{MB}\times B$ 对
     96 MB L2，恰好预测出 240p 的 $B{=}16$ 与 VGA 的 $B{=}4$；fp16 工作集
     减半，最优 $B$ 翻倍。DeepFlow fp16 在 720p 溢出（NaN），须用 fp32。
@@ -760,32 +772,35 @@
 % -------------------------------------------------------- 15 conclusions ------
 \begin{frame}{Conclusions \& Practical Notes \zh{结论与实用备注}}
   \textbf{Conclusions}
-  \begin{itemize}\itemsep0pt
+  \begin{itemize}\itemsep0pt\small
     \item Batching $+$ \texttt{torch.compile} $+$ \textbf{algorithm-level
-      porting} (median $\to$ selection network, adaptive early exit)
-      \textbf{beats even a hand-written CUDA baseline} (5.5 vs 9.3\,ms
-      4-stream ceiling) --- at \emph{full} fidelity (DeepFlow bit-identical).
-    \item OpenCV-CUDA's own tricks \textbf{transfer cleanly to torch}: kernel
-      fusion via compile, \texttt{calcError}-style split, adaptive/throttled
-      sync.
+      porting} (median $\to$ selection network, adaptive early exit) beats a
+      hand-written CUDA baseline at \emph{full} fidelity (DeepFlow
+      bit-identical).
+    \item OpenCV-CUDA's tricks \textbf{transfer cleanly to torch}: fusion via
+      compile, \texttt{calcError}-style split, adaptive/throttled sync.
+    \item When compile's $\sim$6 kernels/iteration still isn't enough, a
+      \textbf{2-kernel Triton port of the same split} recovers hand-CUDA
+      launch efficiency \emph{without leaving Python}: one file, still
+      batched, deterministic reduction for bitwise batch consistency.
     \item Red-black reordering makes SOR tensor-friendly; the L2-residency
       rule picks the batch size per resolution.
   \end{itemize}
   \textbf{Practical notes}
-  \begin{itemize}\itemsep0pt
-    \item Env: \texttt{uv} project; \texttt{opencv-contrib-python-headless}
-      on compute nodes (no GUI libs); login node has no GPU ---
-      the benchmark script auto-skips unavailable backends.
-    \item GPU runs via SLURM: {\footnotesize
+  \begin{itemize}\itemsep0pt\small
+    \item \texttt{uv} project; \texttt{opencv-contrib-python-headless} on
+      compute nodes; login node has no GPU --- the benchmark script auto-skips
+      unavailable backends.
+    \item GPU runs via SLURM: {\scriptsize
       \texttt{srun -p gpu -w ilps-cn119 --gres=gpu:1 --cpus-per-task=8
       --mem=16G uv run --no-sync python benchmark.py}}
   \end{itemize}
   \vfill
   \begin{cn}
-    批量化 + \texttt{torch.compile} + 算法级移植在保持完整保真度的同时
-    胜过手写 CUDA 基线（5.5 对 9.3 ms）；OpenCV-CUDA 的技巧可干净迁移到
-    torch。实用：\texttt{uv} 管环境，计算节点用 headless OpenCV，GPU 作业经
-    SLURM 提交至 ilps-cn119。
+    批量化 + compile + 算法级移植在完整保真度下已胜过手写 CUDA 基线；当
+    compile 每迭代约 6 次核启动仍不够时，用 \textbf{Triton} 重写同一双核拆分
+    （2 次启动）即可不离开 Python 取得手写 CUDA 的启动效率，并保持批量化与
+    逐位一致。
   \end{cn}
 \end{frame}
 
