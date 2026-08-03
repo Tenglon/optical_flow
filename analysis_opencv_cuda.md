@@ -4,9 +4,11 @@
 about OpenCV is traced to a file/line in the sources listed in §0. Our own timings are quoted
 from `res_gpu_a.log` / `res_gpu_b.log` / `res_cpu.log` in this repo (NVIDIA L40, 142 SMs).
 
-> **Placeholder — cv2.cuda TVL1 measured runtime:** `___ ms/pair @ 240x320` (being measured by a
-> sibling agent; see §3.6 for the source-derived estimate and §5.5 for why any such number is
-> **not** directly comparable to ours at default parameters).
+> **Measured (custom CUDA 12.9 build, L40):** cv2.cuda TVL1 **21.1 ms/pair @ 240x320** single-pair
+> resident (42% GPU util), **9.3 ms/pair** with 4 streams x 4 engine instances (92% util);
+> 26.5 / 13.1 ms at 480x640. Inside the source-derived 5-20 ms estimate of §3.6 once the 1-3 ms
+> texture-object overhead is added. See §5.5 for why these numbers are **not** directly comparable
+> to ours at default parameters (no median filter, real early exit, cheaper bicubic).
 
 ---
 
@@ -401,7 +403,9 @@ levels 2–4 ≈ 7.5 ms each, all launch-floor-bound). With the default `epsilon
 cutting the effective iteration count by 3–10×, the expected range is **≈ 5–20 ms/pair**, plus
 1–3 ms of `cudaCreateTextureObject` overhead (§1.3).
 
-> Sibling agent's measured value goes here: `___ ms/pair`.
+> Measured: **21.1 ms/pair** (resident, B=1) / **9.3 ms/pair** (4 streams), 240x320 — the
+> single-pair number lands at the top of the 5-20 ms estimate, consistent with the early exit
+> being partially offset by the per-warp texture-object churn.
 
 > **中文小结**：OpenCV 的优势是真实的。(1) 手工融合 2 launch/迭代，比我们 compile 后的 ~6.9 还少
 > 3.5 倍，DRAM 流量约为我们的 1/2.5~1/3；(2) 原地更新 + 15 个复用 buffer，每对图只用 ~6.7 MB，
@@ -641,7 +645,7 @@ fair comparisons are:
 | **Statefulness / thread-safety** | ❌ 15 mutable member buffers; `nscales_ = s` mutates config permanently (`tvl1flow.cpp:236`) | ✅ pure function | ✅ pure (module-level compile cache only) |
 | **LOC / build** | ≈ 850 lines, 3 files, C++ + CUDA, nvcc + module rebuild | **544 lines, 1 file** | same |
 | **Extensibility** | new kernel + host wrapper + interface change + ABI break | ✅ edit a Python function | ✅ same (recompile is automatic) |
-| **Best measured (240×320)** | `___ ms/pair` *(pending)*; source estimate 5–20 ms/pair, B=1 only | 172.3 ms/pair @ B=64 | **54.5 ms/pair @ B=16** (85 % util) |
+| **Best measured (240×320)** | **21.1 ms/pair** resident B=1 (42 % util); **9.3 ms/pair** with 4 streams (92 % util) — lighter algorithm variant, see §5.5 | 172.3 ms/pair @ B=64 | **54.5 ms/pair @ B=16** (85 % util) |
 
 ### Bottom line
 
