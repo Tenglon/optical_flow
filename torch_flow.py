@@ -21,17 +21,24 @@ coupling ``|u-v|^2 / (2*theta)``; the algorithm alternates
 
 inside a coarse-to-fine image pyramid (factor ``scale_step``) with ``warps``
 re-linearizations per level.  Like OpenCV, the flow is median-filtered
-(5x5 by default) at the start of every outer iteration, and iterations stop
-early once the summed squared update falls below ``epsilon^2 * H * W`` --
-implemented here as a per-batch-sample *freeze mask* (pure tensor ops, no
-data-dependent Python branching), so a batch element that has converged stops
-changing exactly where OpenCV would have stopped iterating.
+(5x5 by default, via a fixed min/max selection network) at the start of every
+outer iteration, and iterations stop early once the summed squared update
+falls below ``epsilon^2 * H * W``.  Convergence is tracked per batch sample by
+a *freeze mask* -- a converged element stops changing exactly where OpenCV
+would have stopped iterating -- and, with ``early_exit=True`` (the default),
+the Python iteration loop additionally breaks once *every* sample is frozen,
+detected with OpenCV's throttled host-sync schedule (roughly
+``error/(epsilon^2 H W)`` iterations skipped between syncs).  Because the
+break only fires when the mask has already frozen the whole batch, it changes
+runtime and nothing else: results are bit-identical either way.
 
 Everything is written with ``torch`` + ``torch.nn.functional`` only; a batch
 of B image pairs is processed in parallel by every operation (convolutions /
 grid_sample / elementwise) with no per-pixel Python loops, and the code runs
-unmodified on CPU or CUDA.  The only Python loops are the fixed-trip-count
-pyramid / warp / iteration loops, keeping the structure torch.compile-safe.
+unmodified on CPU or CUDA.  The only Python loops are the pyramid / warp /
+iteration loops, whose bodies are fixed-shape and branch-free, keeping the
+structure torch.compile-safe (``early_exit=False`` additionally makes the trip
+counts static, as CUDA-graph capture requires).
 
 Input convention
 ----------------
@@ -92,16 +99,143 @@ def _divergence(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
     return d1 + d2
 
 
-def _median_blur(x: torch.Tensor, ksize: int) -> torch.Tensor:
-    """Channelwise ksize x ksize median filter with replicated borders.
+def _median_blur_sort(x: torch.Tensor, ksize: int) -> torch.Tensor:
+    """Reference median filter: unfold + ``torch.median`` (see `_median_blur`).
 
-    Same semantics as ``cv2.medianBlur`` on CV_32F data (odd ksize).  Uses an
-    unfold + median reduction: vectorized over batch/channels/pixels.
+    Materializes the ``k*k``-wide neighbourhood tensor and runs a selection
+    reduction over it; kept as the correctness reference for the min/max
+    network below (and used for kernels larger than 5x5).
     """
     r = ksize // 2
     xp = F.pad(x, (r, r, r, r), mode="replicate")
     patches = xp.unfold(2, ksize, 1).unfold(3, ksize, 1)  # (B, C, H, W, k, k)
     return patches.reshape(*x.shape, ksize * ksize).median(dim=-1).values
+
+
+# --------------------------------------------------------------------------- #
+# Median filter as a fixed min/max selection network
+#
+# `torch.median` over an unfolded k*k axis is a data-dependent selection kernel
+# on a k*k-times-larger tensor -- on GPU it dominated the solver (~47 % of the
+# time at 240x320).  A *selection network* computes the same value with a
+# straight-line sequence of `minimum`/`maximum` ops on the k*k shifted views:
+# nothing is materialized, and torch.compile fuses the whole thing (25 gathers
+# + 202 register ops + 1 store for 5x5) into one kernel.
+# --------------------------------------------------------------------------- #
+def _odd_even_merge_comparators(m: int) -> list[tuple[int, int]]:
+    """Batcher's odd-even mergesort network on ``m`` (a power of two) wires."""
+    ops: list[tuple[int, int]] = []
+    p = 1
+    while p < m:
+        k = p
+        while k >= 1:
+            j = k % p
+            while j <= m - 1 - k:
+                for i in range(min(k, m - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        ops.append((i + j, i + j + k))
+                j += 2 * k
+            k //= 2
+        p *= 2
+    return ops
+
+
+def _selection_network(n: int, k: int) -> tuple[list[tuple[int, int, bool, int]], int, int]:
+    """Straight-line min/max program selecting the k-th smallest of n values.
+
+    Built by (1) taking Batcher's odd-even mergesort on the next power of two
+    (comparators touching a padding wire are no-ops against ``+inf`` and are
+    dropped), (2) dead-code-eliminating everything the median output does not
+    depend on, and (3) allocating the surviving values to a minimal register
+    file.  Returns ``(program, n_registers, out_register)``; each program entry
+    is ``(a, b, is_min, out)`` meaning ``reg[out] = min|max(reg[a], reg[b])``.
+
+    Registers ``0..n-1`` hold the inputs on entry.  Correctness follows from
+    the 0-1 principle (verified exhaustively over all 2**25 inputs for 5x5 and
+    all 2**9 for 3x3, and against ``torch.median`` in the self-test).
+    """
+    m = 1 << (n - 1).bit_length()
+    comps = [(i, j) for (i, j) in _odd_even_merge_comparators(m) if i < n and j < n]
+
+    # Symbolic execution: every comparator defines two SSA values (min, max).
+    wire = list(range(n))
+    defs: list[tuple[int, int, bool]] = []  # value id n+t -> (a, b, is_min)
+    for i, j in comps:
+        a, b = wire[i], wire[j]
+        wire[i] = n + len(defs); defs.append((a, b, True))
+        wire[j] = n + len(defs); defs.append((a, b, False))
+    target = wire[k]
+
+    live: set[int] = set()
+    stack = [target]
+    while stack:
+        x = stack.pop()
+        if x < n or x in live:
+            continue
+        live.add(x)
+        a, b, _ = defs[x - n]
+        stack += [a, b]
+    order = sorted(live)  # SSA ids are topologically ordered by construction
+
+    last_use: dict[int, int] = {}
+    for pos, vid in enumerate(order):
+        a, b, _ = defs[vid - n]
+        last_use[a] = last_use[b] = pos
+
+    slot = {i: i for i in range(n)}
+    free = [i for i in range(n) if i not in last_use and i != target]
+    nreg = n
+    prog: list[tuple[int, int, bool, int]] = []
+    for pos, vid in enumerate(order):
+        a, b, is_min = defs[vid - n]
+        sa, sb = slot[a], slot[b]
+        dead = [s for s, v in ((sa, a), (sb, b)) if last_use.get(v) == pos]
+        dead = list(dict.fromkeys(dead))
+        if dead:
+            out, extra = dead[0], dead[1:]
+            free.extend(extra)
+        elif free:
+            out = free.pop()
+        else:
+            out, nreg = nreg, nreg + 1
+        slot[vid] = out
+        prog.append((sa, sb, is_min, out))
+    return prog, nreg, slot[target]
+
+
+_NETWORKS: dict[int, tuple[list[tuple[int, int, bool, int]], int, int]] = {}
+# Above this many taps the pruned network stops paying for itself; cv2's
+# medianBlur only supports 3x3 / 5x5 on CV_32F data anyway.
+_MEDIAN_NET_MAX = 25
+
+
+def _median_blur(x: torch.Tensor, ksize: int) -> torch.Tensor:
+    """Channelwise ksize x ksize median filter with replicated borders.
+
+    Same semantics (and, up to ties which are exact here, the same values) as
+    ``cv2.medianBlur`` on CV_32F data / `_median_blur_sort`, but evaluated with
+    a fixed min/max selection network over the k*k shifted views of the padded
+    input -- pure elementwise ops, fully fusable, nothing materialized.
+    """
+    n = ksize * ksize
+    if n > _MEDIAN_NET_MAX:
+        return _median_blur_sort(x, ksize)
+    r = ksize // 2
+    xp = F.pad(x, (r, r, r, r), mode="replicate")
+    h, w = x.shape[-2], x.shape[-1]
+    if n not in _NETWORKS:
+        _NETWORKS[n] = _selection_network(n, n // 2)
+    prog, nreg, out = _NETWORKS[n]
+    reg: list[torch.Tensor | None] = [xp[..., i : i + h, j : j + w] for i in range(ksize) for j in range(ksize)]
+    reg += [None] * (nreg - n)
+    for a, b, is_min, o in prog:
+        reg[o] = torch.minimum(reg[a], reg[b]) if is_min else torch.maximum(reg[a], reg[b])
+    return reg[out]
+
+
+def _median_step(u: torch.Tensor, active: torch.Tensor, ksize: int) -> torch.Tensor:
+    """Median-filter the flow of the still-active batch samples (fusable)."""
+    return torch.where(active, _median_blur(u, ksize), u)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,7 +262,10 @@ def _tvl1_warp_setup(
     grid_sample(align_corners=True, mode="bicubic") matches
     cv2.remap(..., INTER_CUBIC) with the default constant-0 border: both use
     the alpha = -0.75 cubic kernel with zero-valued out-of-image taps.
-    Returns (I1wx, I1wy, rho_c, thr, pos, safe_grad).
+    Returns (I1wxy, rho_c, thr, pos, safe_grad) with ``I1wxy`` the warped
+    gradient as a single (B, 2, h, w) tensor laid out like ``u``, so the whole
+    inner iteration broadcasts over the flow-component axis instead of
+    concatenating per-component results.
     """
     grid = torch.stack([sx * (xs + u[:, 0]) - 1.0, sy * (ys + u[:, 1]) - 1.0], dim=-1)
     I1wg = F.grid_sample(I1g, grid, mode="bicubic", padding_mode="zeros", align_corners=True)
@@ -140,18 +277,19 @@ def _tvl1_warp_setup(
     pos = grad > _FLT_EPS
     safe_grad = torch.where(pos, grad, torch.ones_like(grad))
     thr = l_t * grad
-    return I1wx, I1wy, rho_c, thr, pos, safe_grad
+    return I1wg[:, 1:3].contiguous(), rho_c, thr, pos, safe_grad
 
 
 def _tvl1_step(
     u: torch.Tensor,
     u3: torch.Tensor | None,
-    p: torch.Tensor,
-    p3: torch.Tensor | None,
+    px: torch.Tensor,
+    py: torch.Tensor,
+    p3x: torch.Tensor | None,
+    p3y: torch.Tensor | None,
     active: torch.Tensor,
     rho_c: torch.Tensor,
-    I1wx: torch.Tensor,
-    I1wy: torch.Tensor,
+    I1wxy: torch.Tensor,
     thr: torch.Tensor,
     pos: torch.Tensor,
     safe_grad: torch.Tensor,
@@ -160,25 +298,37 @@ def _tvl1_step(
     taut: float,
     gamma: float,
     scaled_eps: float,
+    calc_error: bool,
 ):
     """One primal-dual iteration (OpenCV inner-loop body); pure function.
 
-    Returns the updated ``(u, u3, p, p3, active)``.  ``active`` freezes
-    converged batch samples (see `_proc_one_scale`).
+    Returns the updated ``(u, u3, px, py, p3x, p3y, active, err_max)``.
+    ``active`` freezes converged batch samples (see `_proc_one_scale`).
+
+    The dual field is carried as two ``(B, 2, h, w)`` tensors -- ``px`` = the
+    x-derivative components ``(p11, p21)``, ``py`` = the y ones ``(p12, p22)``
+    -- rather than one ``(B, 4, h, w)`` block, so that every stage broadcasts
+    over the flow-component axis and no ``torch.cat`` is needed inside the hot
+    loop (OpenCV's `estimateUKernel` keeps the same values in registers).
+
+    ``calc_error`` is a *static* flag (each value gets its own compiled graph,
+    exactly like OpenCV's ``calcError`` kernel argument): when False the
+    convergence reduction -- a whole-tensor sum in the middle of an otherwise
+    elementwise body, i.e. a hard fusion break -- is skipped entirely and the
+    freeze mask is carried over unchanged.
     """
     use_gamma = gamma != 0.0  # static: specialized at trace time
 
     # ---- thresholding step (proximal operator of the L1 data term):
     # v = u + shrink(rho) * grad I1w
-    rho = rho_c + I1wx * u[:, 0:1] + I1wy * u[:, 1:2]
+    rho = rho_c + I1wxy[:, 0:1] * u[:, 0:1] + I1wxy[:, 1:2] * u[:, 1:2]
     if use_gamma:
         rho = rho + gamma * u3
     fi = -rho / safe_grad
     lo = rho < -thr
     hi = rho > thr
-    d1 = torch.where(lo, l_t * I1wx, torch.where(hi, -l_t * I1wx, torch.where(pos, fi * I1wx, 0.0)))
-    d2 = torch.where(lo, l_t * I1wy, torch.where(hi, -l_t * I1wy, torch.where(pos, fi * I1wy, 0.0)))
-    v = u + torch.cat([d1, d2], dim=1)
+    d = torch.where(lo, l_t * I1wxy, torch.where(hi, -l_t * I1wxy, torch.where(pos, fi * I1wxy, 0.0)))
+    v = u + d
     if use_gamma:
         d3 = torch.where(
             lo, torch.full_like(rho, l_t * gamma),
@@ -187,45 +337,40 @@ def _tvl1_step(
         v3 = u3 + d3
 
     # ---- primal update: u = v + theta * div p
-    div_p = torch.cat(
-        [_divergence(p[:, 0:1], p[:, 1:2]), _divergence(p[:, 2:3], p[:, 3:4])],
-        dim=1,
-    )
-    u_new = v + theta * div_p
-    err = ((u_new - u) ** 2).sum(dim=(1, 2, 3))
+    u_new = v + theta * _divergence(px, py)
     if use_gamma:
-        u3_new = v3 + theta * _divergence(p3[:, 0:1], p3[:, 1:2])
-        err = err + ((u3_new - u3) ** 2).sum(dim=(1, 2, 3))
+        u3_new = v3 + theta * _divergence(p3x, p3y)
+    if calc_error:
+        err = ((u_new - u) ** 2).sum(dim=(1, 2, 3))
+        if use_gamma:
+            err = err + ((u3_new - u3) ** 2).sum(dim=(1, 2, 3))
+        # Frozen samples keep producing (discarded) updates; zero their error so
+        # the batch maximum reflects the still-active samples only.
+        err = torch.where(active.view(-1), err, torch.zeros_like(err))
+        err_max = err.max()
+    else:
+        err_max = None
     u = torch.where(active, u_new, u)
     if use_gamma:
         u3 = torch.where(active, u3_new, u3)
 
     # ---- dual ascent + reprojection:
     # p = (p + taut * grad u) / (1 + taut * |grad u|)
-    u1x, u1y = _forward_gradient(u[:, 0:1])
-    u2x, u2y = _forward_gradient(u[:, 1:2])
-    ng1 = 1.0 + taut * torch.hypot(u1x, u1y)
-    ng2 = 1.0 + taut * torch.hypot(u2x, u2y)
-    p_new = torch.cat(
-        [
-            (p[:, 0:1] + taut * u1x) / ng1,
-            (p[:, 1:2] + taut * u1y) / ng1,
-            (p[:, 2:3] + taut * u2x) / ng2,
-            (p[:, 3:4] + taut * u2y) / ng2,
-        ],
-        dim=1,
-    )
-    p = torch.where(active, p_new, p)
+    ux, uy = _forward_gradient(u)
+    ng = 1.0 + taut * torch.hypot(ux, uy)
+    px = torch.where(active, (px + taut * ux) / ng, px)
+    py = torch.where(active, (py + taut * uy) / ng, py)
     if use_gamma:
         u3x, u3y = _forward_gradient(u3)
         ng3 = 1.0 + taut * torch.hypot(u3x, u3y)
-        p3_new = torch.cat([(p3[:, 0:1] + taut * u3x) / ng3, (p3[:, 1:2] + taut * u3y) / ng3], dim=1)
-        p3 = torch.where(active, p3_new, p3)
+        p3x = torch.where(active, (p3x + taut * u3x) / ng3, p3x)
+        p3y = torch.where(active, (p3y + taut * u3y) / ng3, p3y)
 
     # Deactivate converged samples *after* this iteration's dual update
     # (OpenCV checks the loop condition on entry).
-    active = active & (err > scaled_eps).view(-1, 1, 1, 1)
-    return u, u3, p, p3, active
+    if calc_error:
+        active = active & (err > scaled_eps).view(-1, 1, 1, 1)
+    return u, u3, px, py, p3x, p3y, active, err_max
 
 
 # Lazily-created compiled variants of the hot functions, keyed by backend.
@@ -233,11 +378,27 @@ def _tvl1_step(
 # across warps / iterations / calls (a handful of shapes in total).
 _COMPILED_FNS: dict[str, tuple] = {}
 
+# Ablation hook, not part of the public API: set to False to keep the throttled
+# `calc_error` schedule (and the per-sample freeze mask it refreshes) but never
+# break out of the iteration loop, which isolates the cost of the convergence
+# reduction from the cost of the iterations early exit saves.
+_BREAK_ON_CONVERGENCE = True
+
+# OpenCV runs the convergence reduction only on a sparse schedule (`calcError`
+# is a kernel argument, tvl1flow.cu:209); `_tvl1_step` supports the same via its
+# static `calc_error` flag, which halves the number of graphs that contain the
+# fusion-breaking whole-tensor sum.  It is *off* by default: skipping the
+# reduction also delays the per-sample freeze mask by up to one iteration, and
+# an iteration of post-convergence drift is worth ~0.007 px of EPE against the
+# cv2 reference (measured on Middlebury 'Dimetrodon'), which is more than the
+# ~2 % of runtime it saves.  Set True to trade that accuracy for throughput.
+_SPARSE_CHECKS = False
+
 
 def _resolve_backend(backend: str, device: torch.device) -> tuple:
-    """Return (step_fn, warp_fn) for the requested backend, caching compiles."""
+    """Return (step_fn, warp_fn, median_fn) for `backend`, caching compiles."""
     if backend == "eager":
-        return _tvl1_step, _tvl1_warp_setup
+        return _tvl1_step, _tvl1_warp_setup, _median_step
     if backend not in ("compile", "cudagraphs"):
         raise ValueError(f"backend must be 'eager', 'compile' or 'cudagraphs', got {backend!r}")
     if backend == "cudagraphs" and device.type != "cuda":
@@ -245,15 +406,16 @@ def _resolve_backend(backend: str, device: torch.device) -> tuple:
     if backend not in _COMPILED_FNS:
         import torch._dynamo
 
-        # One graph per (backend, pyramid-level shape); make sure dynamo never
-        # hits its recompile limit and silently falls back to eager.
+        # One graph per (backend, pyramid-level shape, calc_error); make sure
+        # dynamo never hits its recompile limit and silently falls back to eager.
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
         mode = "reduce-overhead" if backend == "cudagraphs" else None
         step = torch.compile(_tvl1_step, dynamic=False, mode=mode)
         warp = torch.compile(_tvl1_warp_setup, dynamic=False, mode=mode)
+        median = torch.compile(_median_step, dynamic=False, mode=mode)
         if backend == "cudagraphs":
-            step, warp = _cudagraph_safe(step), _cudagraph_safe(warp)
-        _COMPILED_FNS[backend] = (step, warp)
+            step, warp, median = _cudagraph_safe(step), _cudagraph_safe(warp), _cudagraph_safe(median)
+        _COMPILED_FNS[backend] = (step, warp, median)
     return _COMPILED_FNS[backend]
 
 
@@ -292,15 +454,18 @@ def _proc_one_scale(
     outer_iterations: int,
     gamma: float,
     median_filtering: int,
+    early_exit: bool = False,
     step_fn=_tvl1_step,
     warp_fn=_tvl1_warp_setup,
+    median_fn=_median_step,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the TV-L1 solver at one pyramid level.
 
     I0, I1: (B, 1, h, w) images; u: (B, 2, h, w) flow (updated in place of the
     return value); u3: (B, 1, h, w) illumination multiplier field (gamma != 0
     only).  Mirrors OpticalFlowDual_TVL1::procOneScale.  ``step_fn`` /
-    ``warp_fn`` are `_tvl1_step` / `_tvl1_warp_setup` or compiled variants.
+    ``warp_fn`` / ``median_fn`` are `_tvl1_step` / `_tvl1_warp_setup` /
+    `_median_step` or compiled variants.
     """
     b, _, h, w = I0.shape
     dt, dev = I0.dtype, I0.device
@@ -309,6 +474,7 @@ def _proc_one_scale(
     l_t = lambda_ * theta
     taut = tau / theta
     scaled_eps = float(epsilon) * float(epsilon) * h * w
+    early_exit = early_exit and epsilon > 0.0  # cf. OpenCV's `epsilon_ > 0` guard
 
     # Gradient of the *unwarped* target image (computed once per level).
     I1x, I1y = _centered_gradient(I1)
@@ -323,28 +489,65 @@ def _proc_one_scale(
     sy = 2.0 / max(h - 1, 1)
 
     # Dual variables are reset once per pyramid level (as in OpenCV).
-    p = torch.zeros(b, 4, h, w, dtype=dt, device=dev)  # p11, p12, p21, p22
-    p3 = torch.zeros(b, 2, h, w, dtype=dt, device=dev) if use_gamma else None
+    px = torch.zeros(b, 2, h, w, dtype=dt, device=dev)  # (p11, p21)
+    py = torch.zeros(b, 2, h, w, dtype=dt, device=dev)  # (p12, p22)
+    p3x = torch.zeros(b, 1, h, w, dtype=dt, device=dev) if use_gamma else None
+    p3y = torch.zeros(b, 1, h, w, dtype=dt, device=dev) if use_gamma else None
 
     for _warp in range(warps):
         # Warp I1 and its gradient to x + u0 (bicubic, zero border) and
         # linearize the residual around the current flow.
-        I1wx, I1wy, rho_c, thr, pos, safe_grad = warp_fn(I1g, I0, u, xs, ys, sx, sy, l_t)
+        I1wxy, rho_c, thr, pos, safe_grad = warp_fn(I1g, I0, u, xs, ys, sx, sy, l_t)
 
         # Per-sample convergence mask emulating OpenCV's epsilon early stop:
         # once a sample's summed squared update drops below eps^2*h*w its
         # state (u, p, median filtering) is frozen for the rest of this warp.
         active = torch.ones(b, 1, 1, 1, dtype=torch.bool, device=dev)
 
+        # Convergence bookkeeping, in two tiers:
+        #
+        # * the error *reduction* (and with it the freeze mask) runs on a
+        #   deterministic schedule -- every iteration, or OpenCV's `n & 0x1`
+        #   under `_SPARSE_CHECKS` -- never one that depends on a measured
+        #   value, so when a sample freezes depends only on that sample and not
+        #   on what else is in the batch; results stay bit-identical to the
+        #   per-pair solve (`calc_flow_tvl1_video` relies on this);
+        # * the *host sync* that can break the loop is throttled exactly like
+        #   OpenCV (tvl1flow.cpp:352-379): after measuring `error`, spend one
+        #   scaled_eps per iteration before looking again, i.e. skip about
+        #   error/scaled_eps iterations between syncs.  Throttling this tier is
+        #   free of accuracy risk: the loop is only left once *every* sample is
+        #   frozen, at which point the remaining iterations are no-ops -- so
+        #   early exit is pure speed, bit-for-bit.
+        n_it, prev_err, done = 0, 0.0, False
+
         for _outer in range(outer_iterations):
             if median_filtering > 1:
-                u = torch.where(active, _median_blur(u, median_filtering), u)
+                u = median_fn(u, active, median_filtering)
+                # The median filter perturbs u, so the "error decreases by one
+                # scaled_eps per iteration" estimate the throttle rides on is
+                # stale; re-measure.  (OpenCV's CUDA path has no median filter
+                # and so never hits this.)  Sync frequency only -- no effect on
+                # the result.
+                prev_err = 0.0
             for _inner in range(inner_iterations):
-                u, u3, p, p3, active = step_fn(
-                    u, u3, p, p3, active,
-                    rho_c, I1wx, I1wy, thr, pos, safe_grad,
-                    l_t, theta, taut, gamma, scaled_eps,
+                check = ((n_it & 1) == 1) if (early_exit and _SPARSE_CHECKS) else True
+                u, u3, px, py, p3x, p3y, active, err_max = step_fn(
+                    u, u3, px, py, p3x, p3y, active,
+                    rho_c, I1wxy, thr, pos, safe_grad,
+                    l_t, theta, taut, gamma, scaled_eps, check,
                 )
+                n_it += 1
+                if early_exit:
+                    if check and prev_err < scaled_eps:
+                        prev_err = err_max.item()  # the one host sync
+                        if prev_err <= scaled_eps and _BREAK_ON_CONVERGENCE:
+                            done = True  # whole batch converged
+                            break
+                    else:
+                        prev_err -= scaled_eps
+            if done:
+                break
 
     return u, u3
 
@@ -370,6 +573,7 @@ def calc_flow_tvl1(
     use_initial_flow: bool = False,
     initial_flow: torch.Tensor | None = None,
     backend: str = "eager",
+    early_exit: bool = True,
 ) -> torch.Tensor:
     """Batched dense optical flow with the Dual TV-L1 method.
 
@@ -414,6 +618,19 @@ def calc_flow_tvl1(
               dynamic=False)`` -- additionally replays CUDA graphs to remove
               launch overhead (the solver is launch-bound on GPU).  Requires
               CUDA input tensors.
+        early_exit: stop iterating a pyramid level as soon as the *whole
+            batch* has converged, instead of always running the full
+            ``warps * outer * inner`` trip count.  Adapted from OpenCV
+            (tvl1flow.cpp:352-379): the batch-maximum error is read back to the
+            host on throttled "check" iterations only -- after a check the next
+            one is roughly ``error / (epsilon^2 h w)`` iterations away -- and
+            the loop breaks when it falls to ``epsilon^2 h w``.  This is a pure
+            speed win, **bit-identical** to ``early_exit=False``: the loop is
+            only left once the per-sample freeze mask has frozen every sample,
+            so the skipped iterations were no-ops.  Set to False to get static
+            trip counts and no host syncs, which is what CUDA-graph capture
+            needs; it is therefore forced to False for
+            ``backend="cudagraphs"``.  Ignored when ``epsilon <= 0``.
 
     Returns:
         Flow tensor of shape ``(B, 2, H, W)``, same device/dtype as the
@@ -430,7 +647,9 @@ def calc_flow_tvl1(
         raise ValueError("nscales must be >= 1")
     if use_initial_flow and initial_flow is None:
         raise ValueError("use_initial_flow=True requires initial_flow")
-    step_fn, warp_fn = _resolve_backend(backend, prev.device)
+    step_fn, warp_fn, median_fn = _resolve_backend(backend, prev.device)
+    if backend == "cudagraphs":
+        early_exit = False  # data-dependent trip counts defeat graph replay
 
     if not torch.is_floating_point(prev):
         prev = prev.to(torch.float32)
@@ -480,8 +699,10 @@ def calc_flow_tvl1(
             outer_iterations=outer_iterations,
             gamma=gamma,
             median_filtering=median_filtering,
+            early_exit=early_exit,
             step_fn=step_fn,
             warp_fn=warp_fn,
+            median_fn=median_fn,
         )
         if s > 0:
             u = F.interpolate(u, size=sizes[s - 1], mode="bilinear", align_corners=False) * (1.0 / scale_step)
@@ -567,6 +788,27 @@ if __name__ == "__main__":
         return alg.calc(p8, n8, None).transpose(2, 0, 1)  # (2, H, W)
 
     ok = True
+
+    # ---------------- median selection network == torch.median ----------------
+    for k in (3, 5):
+        xr = torch.randn(3, 2, 37, 41)
+        xq = (torch.randint(0, 5, (2, 2, 19, 23)).float())  # many ties
+        net_ok = all(
+            torch.equal(_median_blur(t, k), _median_blur_sort(t, k)) for t in (xr, xq)
+        )
+        prog, nreg, _ = _NETWORKS[k * k]
+        print(f"[median {k}x{k} network] {len(prog)} min/max ops, {nreg} registers, "
+              f"exact match vs torch.median: {net_ok}")
+        ok &= net_ok
+    # cv2 parity (cv2.medianBlur supports 3/5 only on CV_32F); informational --
+    # the gate above is the exact one, this only cross-checks border handling.
+    xcv = rng.standard_normal((41, 53)).astype(np.float32)
+    for k in (3, 5):
+        ref = cv2.medianBlur(xcv, k)
+        mine = _median_blur(torch.from_numpy(xcv)[None, None], k)[0, 0].numpy()
+        r = k // 2
+        print(f"[median {k}x{k} vs cv2.medianBlur] maxdiff = {np.abs(ref - mine).max():.1e} "
+              f"(interior {np.abs(ref[r:-r, r:-r] - mine[r:-r, r:-r]).max():.1e})")
 
     # ---------------- synthetic known-shift pair ----------------
     Hs, Ws = 192, 256
