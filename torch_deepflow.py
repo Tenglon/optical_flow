@@ -438,8 +438,11 @@ def calc_flow_deepflow(
         raise RuntimeError("backend='cudagraphs' requires CUDA input tensors")
     sys_fn, sor_fn = _resolve_backend(backend)
     dev = prev.device
-    I0 = prev.to(torch.float32)
-    I1 = next.to(torch.float32)
+    # Preserve the input dtype (fp16/bf16 supported; fp32 promoted from ints)
+    # so reduced-precision batches get the full bandwidth win.
+    work_dtype = prev.dtype if prev.dtype.is_floating_point else torch.float32
+    I0 = prev.to(work_dtype)
+    I1 = next.to(work_dtype)
     B, H, W = I0.shape
 
     # pre-smooth full-resolution images (once), then build the pyramid
@@ -475,7 +478,7 @@ def calc_flow_deepflow(
         sor_fn=sor_fn,
     )
 
-    flow = torch.zeros(B, 2, *sizes[-1], device=dev, dtype=torch.float32)
+    flow = torch.zeros(B, 2, *sizes[-1], device=dev, dtype=work_dtype)
     for level in range(len(sizes) - 1, -1, -1):
         flow = _variational_refinement(pyr0[level], pyr1[level], flow, **vr_kwargs)
         if level > 0:

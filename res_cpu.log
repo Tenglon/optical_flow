@@ -1,0 +1,18 @@
+# opencv 5.0.0 threads=48 cpus=48
+algo           res pairs reps     ms/pair  rep_s_min  spread
+tvl1       240x320     2    2       419.4       0.84   0.002
+RESULT {"algo": "tvl1", "res": "240x320", "px_per_pair": 76800, "n_pairs": 2, "reps": 2, "rep_s_min": 0.8388717010384426, "ms_per_pair": 419.4358505192213, "spread": 0.0022659793229979695, "threads": 48, "device": "cpu"}
+tvl1       480x640     2    2      1092.1       2.18   0.005
+RESULT {"algo": "tvl1", "res": "480x640", "px_per_pair": 307200, "n_pairs": 2, "reps": 2, "rep_s_min": 2.184260715963319, "ms_per_pair": 1092.1303579816595, "spread": 0.004678399838985019, "threads": 48, "device": "cpu"}
+tvl1       480x854     2    2      1406.9       2.81   0.033
+RESULT {"algo": "tvl1", "res": "480x854", "px_per_pair": 409920, "n_pairs": 2, "reps": 2, "rep_s_min": 2.813711401890032, "ms_per_pair": 1406.855700945016, "spread": 0.03251343686672986, "threads": 48, "device": "cpu"}
+tvl1      720x1280     2    2      3093.3       6.19   0.026
+RESULT {"algo": "tvl1", "res": "720x1280", "px_per_pair": 921600, "n_pairs": 2, "reps": 2, "rep_s_min": 6.186540444032289, "ms_per_pair": 3093.2702220161445, "spread": 0.026092442045189283, "threads": 48, "device": "cpu"}
+deepflow   240x320     2    2       297.4       0.59   0.039
+RESULT {"algo": "deepflow", "res": "240x320", "px_per_pair": 76800, "n_pairs": 2, "reps": 2, "rep_s_min": 0.5948205579770729, "ms_per_pair": 297.41027898853645, "spread": 0.039472626975974465, "threads": 48, "device": "cpu"}
+deepflow   480x640     2    2       633.5       1.27   0.049
+RESULT {"algo": "deepflow", "res": "480x640", "px_per_pair": 307200, "n_pairs": 2, "reps": 2, "rep_s_min": 1.2670825630193576, "ms_per_pair": 633.5412815096788, "spread": 0.049034337377869226, "threads": 48, "device": "cpu"}
+deepflow   480x854     2    2       746.2       1.49   0.020
+RESULT {"algo": "deepflow", "res": "480x854", "px_per_pair": 409920, "n_pairs": 2, "reps": 2, "rep_s_min": 1.4924093160079792, "ms_per_pair": 746.2046580039896, "spread": 0.020227300731033914, "threads": 48, "device": "cpu"}
+deepflow  720x1280     2    2      1313.5       2.63   0.011
+RESULT {"algo": "deepflow", "res": "720x1280", "px_per_pair": 921600, "n_pairs": 2, "reps": 2, "rep_s_min": 2.6269053230062127, "ms_per_pair": 1313.4526615031064, "spread": 0.011381305475932042, "threads": 48, "device": "cpu"}
