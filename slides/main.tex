@@ -589,71 +589,87 @@
 
 % ------------------------------------------------- 15 cv2.cuda baseline -------
 \begin{frame}{How Strong Is the cv2.cuda Baseline? \zh{cv2.cuda 基线有多强}}
-  \begin{itemize}\itemsep2pt
-    \item \textbf{Single pair, GPU-resident: 21.1 ms} --- but only
-      \textbf{42--47\% utilization} on the L40: launch-latency-bound even with
-      data resident.
-    \item Best scaling we achieved: \textbf{4 CUDA streams $\times$ 4 solver
-      instances $\to$ 9.3 ms/pair} (92\% util) --- 2.3$\times$, not 4$\times$.
-    \item OpenCV's CUDA TV-L1 is a \textbf{lighter variant} of its CPU
-      algorithm (per OpenCV's own parity test): \emph{no median filtering},
-      real early exit, bicubic $a{=}{-}0.5$ vs $-0.75$.
-    \item Our \textbf{5.5 ms computes the full CPU algorithm} (median filter
-      included) and still beats the 4-stream ceiling by
-      \textbf{1.7$\times$}.
-    \item \textbf{DeepFlow}: OpenCV has \emph{no} GPU version at all
-      (\texttt{cudaoptflow} $=$ \{brox, farneback, nvof, pyrlk, tvl1\} only).
-      Our 16.0 ms (fp16: 7.4) vs their CPU 297 ms $=$
-      \textbf{18.6$\times$} (fp16: \textbf{40$\times$}) over the only
-      implementation that exists.
+  \begin{itemize}\itemsep1pt\footnotesize
+    \item Single pair, resident: only \textbf{42--47\% utilization}
+      (launch-latency-bound); 4 streams $\times$ 4 instances give
+      \textbf{2.3$\times$, not 4$\times$} (92\% util).
+    \item Their CUDA TV-L1 is a \textbf{lighter variant} (per OpenCV's own
+      parity test): \emph{no median filter}, real early exit, bicubic
+      $a{=}{-}0.5$ vs $-0.75$ $\Rightarrow$ \textbf{2.5--3$\times$ fewer DRAM
+      bytes per iteration}.
+    \item \textbf{DeepFlow}: no GPU version exists
+      (\texttt{cudaoptflow} $=$ \{brox, farneback, nvof, pyrlk, tvl1\});
+      our 16.0\,ms (fp16: 7.4) vs their CPU 297\,ms $=$
+      \textbf{18.6$\times$} (fp16: \textbf{40$\times$}).
   \end{itemize}
+  \centering
+  {\footnotesize TV-L1 head-to-head, ms/pair:\quad
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    & \multicolumn{2}{c}{cv2.cuda (variant)} & \multicolumn{2}{c}{ours (full algo)} \\
+    \cmidrule(lr){2-3}\cmidrule(lr){4-5}
+    Resolution & 1 pair & 4-stream & fp32 & fp16 \\
+    \midrule
+    $240{\times}320$  & 21.1 & 9.3  & \textbf{5.5} & --- \\
+    $480{\times}640$  & 26.5 & 13.1 & 22.6 & 15.2 \\
+    $480{\times}854$  & 27.2 & 14.0 & 27.3 & 19.0 \\
+    $720{\times}1280$ & 35.8 & \textbf{21.6} & 62.0 & 41.9 \\
+    \bottomrule
+  \end{tabular}}
+  \par\smallskip
+  {\footnotesize\itshape Honest verdict: full-fidelity torch beats their
+   single-pair baseline up to $\sim$480p and matches their 4-stream ceiling
+   with fp16; at 720p their hand-fused kernels win 1.7--1.9$\times$ --- once
+   one pair saturates the GPU, the per-iteration DRAM advantage decides, and
+   batching no longer compensates.}
   \vfill
   \begin{cn}
-    cv2.cuda 单对 21.1 ms 时利用率仅 42--47\%（核启动延迟受限）；四流并发上限
-    9.3 ms（92\% 利用率，2.3 倍而非 4 倍）。且其 CUDA 版是\textbf{简化变体}：
-    无中值滤波、真提前退出、双三次 $a{=}{-}0.5$。我们的 5.5 ms 计算\textbf{完整}
-    算法仍快 1.7 倍；DeepFlow 则完全没有 OpenCV GPU 版，16.0 ms（fp16 7.4）
-    对其 CPU 297 ms 为 18.6 倍（fp16 40 倍）。
+    cv2.cuda 单对利用率仅 42--47\%，四流上限 2.3 倍；其 CUDA 版为简化变体。
+    对比结论：全保真 torch 在 $\le$480p 胜其单对基线，fp16 可追平其四流上限；
+    720p 时其手写融合核反超 1.7--1.9 倍——单对已喂饱 GPU 后带宽差距起决定
+    作用，批量化不再能补偿。
   \end{cn}
 \end{frame}
 
 % ------------------------------------------- 16 multi-resolution + util -------
 \begin{frame}{Scaling with Resolution \& GPU Utilization \zh{分辨率扩展与利用率}}
   \centering
-  {\small \texttt{torch.compile}, best batch size per resolution
-   (TV-L1 numbers \emph{pre-early-exit}; early exit adds another
-   $\sim$5$\times$ at $240{\times}320$).}
-  \par\smallskip
+  {\small ms/pair, \texttt{torch.compile} $+$ adaptive early exit (TV-L1),
+   best batch size per resolution.}
+  \par
   {\footnotesize
-  \begin{tabular}{@{}lrrrr@{\qquad}rrrr@{}}
+  \begin{tabular}{@{}lrrr@{\qquad}rrr@{}}
     \toprule
-    & \multicolumn{4}{c}{TV-L1} & \multicolumn{4}{c}{DeepFlow} \\
-    \cmidrule(r{2em}){2-5}\cmidrule{6-9}
-    Resolution & $B$ & ms/pair & util & vs cv CPU
-               & $B$ & ms/pair & util & vs cv CPU \\
+    & \multicolumn{3}{c}{TV-L1} & \multicolumn{3}{c}{DeepFlow} \\
+    \cmidrule(r{2em}){2-4}\cmidrule{5-7}
+    Resolution & $B$ & fp32 & fp16$^{a}$ & $B$ & fp32 & fp16 \\
     \midrule
-    $240{\times}320$  & 16 & 54.5 & 85\% & 7.7$\times$ & 64 & 16.0 & 73\% & 18.6$\times$ \\
-    $480{\times}640$  &  4 & 224  & 86\% & 4.9$\times$ & 16 & 71.7 & 67\% & 8.8$\times$ \\
-    $480{\times}854$  &  4 & 323  & 91\% & 4.4$\times$ & 16 & 99.4 & 73\% & 7.5$\times$ \\
-    $720{\times}1280$ &  2 & 733  & 92\% & 4.2$\times$ &  8 & 236.7 & 76\% & 5.5$\times$ \\
+    $240{\times}320$  & 16 & \textbf{5.5} & ---  & 64 & 16.0  & \textbf{7.4} \\
+    $480{\times}640$  &  4 & 22.6 & 15.2 & 16 & 71.7  & 39.5 \\
+    $480{\times}854$  &  4 & 27.3 & 19.0 & 16 & 99.4  & 49.1 \\
+    $720{\times}1280$ &  2 & 62.0 & 41.9 &  8 & 236.7 & ---$^{b}$ \\
     \bottomrule
   \end{tabular}}
-  \par\medskip
-  \begin{itemize}\itemsep1pt
+  \par\smallskip
+  {\scriptsize $^{a}$fp16 at doubled batch ($B{=}8/8/4$) --- half the working
+   set, so the optimal $B$ doubles.\quad
+   $^{b}$DeepFlow fp16 \textbf{overflows (NaN) at 720p} --- use fp32 there.}
+  \par
+  \begin{itemize}\itemsep1pt\small
     \item Saturation batch size falls $\sim 1/\text{pixels}$: once the GPU is
       full, bigger $B$ stops helping.
     \item \textbf{L2-residency cliff}: working set $\approx 3.7$\,MB$\times B$
       vs 96\,MB L2 predicts the optima ($B{=}16$ @240p, $B{=}4$ @VGA)
-      \emph{exactly}.
-    \item 99\% ``utilization'' $\ne$ efficient --- SMs counted busy while
-      waiting on DRAM.
+      \emph{exactly} --- and fp16's halved working set doubles them.
+    \item GPU util 67--92\% across the sweep; high ``utilization'' $\ne$
+      efficient (SMs counted busy while waiting on DRAM).
   \end{itemize}
   \vfill
   \begin{cn}
-    最优批大小随像素数近似反比下降；\textbf{L2 驻留悬崖}：工作集
-    $\approx 3.7\,\mathrm{MB}\times B$ 对 96 MB L2，恰好预测出 240p 的
-    $B{=}16$ 与 VGA 的 $B{=}4$。注意高“利用率”不等于高效——SM 在等 DRAM
-    时也被计为忙。TV-L1 列为未加提前退出的数字（240p 上提前退出再提速约 5 倍）。
+    表为最终（含提前退出）数字。最优批大小随像素数近似反比下降；
+    \textbf{L2 驻留悬崖}：工作集 $\approx 3.7\,\mathrm{MB}\times B$ 对
+    96 MB L2，恰好预测出 240p 的 $B{=}16$ 与 VGA 的 $B{=}4$；fp16 工作集
+    减半，最优 $B$ 翻倍。DeepFlow fp16 在 720p 溢出（NaN），须用 fp32。
   \end{cn}
 \end{frame}
 
