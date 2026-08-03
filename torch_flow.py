@@ -395,14 +395,17 @@ _BREAK_ON_CONVERGENCE = True
 _SPARSE_CHECKS = False
 
 
+_BACKENDS = ("eager", "compile", "cudagraphs", "triton")
+
+
 def _resolve_backend(backend: str, device: torch.device) -> tuple:
     """Return (step_fn, warp_fn, median_fn) for `backend`, caching compiles."""
     if backend == "eager":
         return _tvl1_step, _tvl1_warp_setup, _median_step
-    if backend not in ("compile", "cudagraphs"):
-        raise ValueError(f"backend must be 'eager', 'compile' or 'cudagraphs', got {backend!r}")
-    if backend == "cudagraphs" and device.type != "cuda":
-        raise RuntimeError("backend='cudagraphs' requires CUDA input tensors")
+    if backend not in _BACKENDS:
+        raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
+    if backend in ("cudagraphs", "triton") and device.type != "cuda":
+        raise RuntimeError(f"backend={backend!r} requires CUDA input tensors")
     if backend not in _COMPILED_FNS:
         import torch._dynamo
 
@@ -410,13 +413,31 @@ def _resolve_backend(backend: str, device: torch.device) -> tuple:
         # dynamo never hits its recompile limit and silently falls back to eager.
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
         mode = "reduce-overhead" if backend == "cudagraphs" else None
-        step = torch.compile(_tvl1_step, dynamic=False, mode=mode)
         warp = torch.compile(_tvl1_warp_setup, dynamic=False, mode=mode)
         median = torch.compile(_median_step, dynamic=False, mode=mode)
+        if backend == "triton":
+            # Only the 2-kernel primal/dual pair is hand-written; the per-warp
+            # setup (grid_sample) and the median network stay Inductor-compiled.
+            from triton_tvl1 import TritonTVL1Step
+
+            step = TritonTVL1Step()
+        else:
+            step = torch.compile(_tvl1_step, dynamic=False, mode=mode)
         if backend == "cudagraphs":
             step, warp, median = _cudagraph_safe(step), _cudagraph_safe(warp), _cudagraph_safe(median)
         _COMPILED_FNS[backend] = (step, warp, median)
     return _COMPILED_FNS[backend]
+
+
+def _err_scalar(err) -> float:
+    """Host-side batch-maximum error (the one throttled sync per check window).
+
+    ``_tvl1_step`` already reduces to a 0-dim tensor; the Triton step returns the
+    per-sample ``(B,)`` vector instead, because folding the batch axis on-device
+    would cost a third kernel launch on every iteration while the value is only
+    ever needed on the rare iterations that actually sync.
+    """
+    return float(err.max()) if err.ndim else float(err)
 
 
 def _cudagraph_safe(fn):
@@ -540,7 +561,7 @@ def _proc_one_scale(
                 n_it += 1
                 if early_exit:
                     if check and prev_err < scaled_eps:
-                        prev_err = err_max.item()  # the one host sync
+                        prev_err = _err_scalar(err_max)  # the one host sync
                         if prev_err <= scaled_eps and _BREAK_ON_CONVERGENCE:
                             done = True  # whole batch converged
                             break
@@ -618,6 +639,13 @@ def calc_flow_tvl1(
               dynamic=False)`` -- additionally replays CUDA graphs to remove
               launch overhead (the solver is launch-bound on GPU).  Requires
               CUDA input tensors.
+            - ``"triton"``: the primal/dual pair of each iteration runs as two
+              hand-written Triton kernels (:mod:`triton_tvl1`), updating ``u``
+              and ``p`` in place -- OpenCV's CUDA kernel split, but batched over
+              ``(B, 2, H, W)``.  Exactly 2 launches per iteration against
+              Inductor's ~6.9, and correspondingly less DRAM traffic.  The
+              per-warp setup and the median network stay Inductor-compiled.
+              Requires CUDA input tensors; ``gamma != 0`` is not implemented.
         early_exit: stop iterating a pyramid level as soon as the *whole
             batch* has converged, instead of always running the full
             ``warps * outer * inner`` trip count.  Adapted from OpenCV
@@ -677,6 +705,8 @@ def calc_flow_tvl1(
     # Initial flow at the coarsest scale.
     if use_initial_flow:
         u = initial_flow.to(device=dev, dtype=dt)
+        if u is initial_flow:
+            u = u.clone()  # backend="triton" updates u in place; never alias the caller's
         for s in range(1, ns):
             u = F.interpolate(u, size=sizes[s], mode="bilinear", align_corners=False) * scale_step
     else:

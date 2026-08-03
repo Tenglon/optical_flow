@@ -1,0 +1,77 @@
+srun: job 338916 queued and waiting for resources
+srun: job 338916 has been allocated resources
+device: NVIDIA L40  torch 2.13.0+cu130
+triton 3.7.1
+
+== [1] per-kernel unit test vs eager _tvl1_step ==
+  [calc_error=1 frozen=0] max|u _ref - u _triton| = 2.38e-07 ok
+  [calc_error=1 frozen=0] max|px_ref - px_triton| = 1.79e-07 ok
+  [calc_error=1 frozen=0] max|py_ref - py_triton| = 1.79e-07 ok
+  [calc_error=1 frozen=0] active exact: True
+  [calc_error=1 frozen=0] err_max rel diff = 0.00e+00 ok
+  [calc_error=1 frozen=1] max|u _ref - u _triton| = 2.38e-07 ok
+  [calc_error=1 frozen=1] max|px_ref - px_triton| = 1.79e-07 ok
+  [calc_error=1 frozen=1] max|py_ref - py_triton| = 1.79e-07 ok
+  [calc_error=1 frozen=1] active exact: True
+  [calc_error=1 frozen=1] err_max rel diff = 0.00e+00 ok
+  [calc_error=0 frozen=0] max|u _ref - u _triton| = 2.38e-07 ok
+  [calc_error=0 frozen=0] max|px_ref - px_triton| = 1.79e-07 ok
+  [calc_error=0 frozen=0] max|py_ref - py_triton| = 1.79e-07 ok
+  [calc_error=0 frozen=0] active exact: True
+  [calc_error=0 frozen=1] max|u _ref - u _triton| = 2.38e-07 ok
+  [calc_error=0 frozen=1] max|px_ref - px_triton| = 1.79e-07 ok
+  [calc_error=0 frozen=1] max|py_ref - py_triton| = 1.79e-07 ok
+  [calc_error=0 frozen=1] active exact: True
+
+== [2] short solve (2 scales, 1 warp, 5 iters, no median, eps=0), B=16 ==
+  [short/eager] 0.0s  non-finite=0  range [-5.943, 6.910]
+  [short/compile] 1.5s  non-finite=0  range [-5.943, 6.909]
+  [short/triton] 1.5s  non-finite=0  range [-5.943, 6.909]
+  pair                  mean px     max px   max comp
+  compile vs eager    8.554e-06  4.454e-03  4.305e-03
+  triton vs eager     8.554e-06  4.454e-03  4.305e-03
+  triton vs compile   1.728e-08  5.761e-05  5.627e-05
+  GATE short: max comp 5.63e-05 < 0.001 -> PASS
+
+== [4] full solve at cv2 defaults, 8 pairs tiled to B=16 @240x320 ==
+  [default/eager] 0.6s  non-finite=0  range [-21.186, 11.400]
+  [default/compile] 3.0s  non-finite=0  range [-21.196, 10.971]
+  [default/triton] 1.8s  non-finite=0  range [-21.531, 11.757]
+  pair                  mean px     max px   max comp
+  compile vs eager    8.752e-03  1.008e+01  8.740e+00
+  triton vs eager     1.076e-02  1.034e+01  1.034e+01
+  triton vs compile   7.745e-03  9.261e+00  9.213e+00
+  GATE noise floor: triton-vs-compile 7.745e-03 <= 1.5x compile-vs-eager 8.752e-03 (1.313e-02) -> PASS
+  (the brief's absolute 1e-3 mean / 0.1 px max gate is not reachable by any backend here:
+   compile-vs-eager alone is 8.752e-03 mean / 10.08 px max)
+
+== [5] mean EPE vs the OpenCV CPU reference ==
+  cv2 CPU on 8 pairs: 2.3s
+  [eager] mean EPE = 0.0257 px, max = 19.874 px
+  [compile] mean EPE = 0.0266 px, max = 19.674 px
+  [triton] mean EPE = 0.0263 px, max = 19.040 px
+  GATE accuracy: |EPE_triton - EPE_compile| = 0.0003 < 0.01 -> PASS
+
+== [6] batch consistency (triton, B=1 vs B=16) ==
+  max|B=16 - B=1| = 0.000e+00   bitwise identical: True -> PASS
+  block configs chosen:
+    B=1 98x131 float32: BH=16 BW=64 warps=8 tiles=21 grid=(3, 7, 1)
+    B=16 98x131 float32: BH=16 BW=64 warps=8 tiles=21 grid=(3, 7, 16)
+    B=1 123x164 float32: BH=16 BW=64 warps=8 tiles=24 grid=(3, 8, 1)
+    B=16 123x164 float32: BH=16 BW=64 warps=8 tiles=24 grid=(3, 8, 16)
+    B=1 154x205 float32: BH=16 BW=64 warps=8 tiles=40 grid=(4, 10, 1)
+    B=16 154x205 float32: BH=16 BW=64 warps=8 tiles=40 grid=(4, 10, 16)
+    B=1 192x256 float32: BH=16 BW=64 warps=8 tiles=48 grid=(4, 12, 1)
+    B=16 192x256 float32: BH=16 BW=64 warps=8 tiles=48 grid=(4, 12, 16)
+    B=1 240x320 float32: BH=8 BW=32 warps=2 tiles=300 grid=(10, 30, 1)
+    B=16 240x320 float32: BH=8 BW=32 warps=2 tiles=300 grid=(10, 30, 16)
+
+== [7] fp16 (kernels promote to fp32 internally; traffic is fp16) ==
+  [compile/fp16] 96.6s  non-finite=0  range [-20.297, 11.836]
+  [triton/fp16] 3.6s  non-finite=0  range [-20.406, 12.633]
+  triton/fp16 vs compile/fp16: mean 1.424e-02 max 1.260e+01 maxcomp 1.260e+01 px
+  [compile] fp16 vs its own fp32: mean 1.794e-02 px
+  [triton] fp16 vs its own fp32: mean 1.728e-02 px
+
+PASS
+EXIT=0

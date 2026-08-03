@@ -29,8 +29,15 @@ import numpy as np
 import torch
 
 import torch_flow
-import torch_flow_orig
 from benchmark_data import load_pairs
+
+# A/B baseline: the pre-optimization solver. Recreate it from git history if
+# needed (torch_flow_orig.py was the working copy of commit 4fdf87f):
+#   git show 4fdf87f:torch_flow.py > torch_flow_orig.py
+try:
+    import torch_flow_orig
+except ImportError:
+    torch_flow_orig = None
 
 HW = (240, 320)
 NPAIRS = 8
